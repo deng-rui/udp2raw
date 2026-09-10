@@ -244,22 +244,22 @@ static void aes_setkey_dec(uint8_t *rk, const uint8_t *key)
   AES_set_decrypt_key(key, AES_KEYSIZE, (AES_KEY *) rk);
 }
 
-static void (*encrypt_ecb) ( int nr,
+static __thread void (*encrypt_ecb) ( int nr,
                              unsigned char *rk,
                              const unsigned char input[16],
                              unsigned char output[16] )
   = aes_encrypt_ecb;
 
-static void (*decrypt_ecb) ( int nr,
+static __thread void (*decrypt_ecb) ( int nr,
                              unsigned char *rk,
                              const unsigned char input[16],
                              unsigned char output[16] )
   = aes_decrypt_ecb;
 
-static void (*setkey_enc) (uint8_t *rk, const uint8_t *key)
+static __thread void (*setkey_enc) (uint8_t *rk, const uint8_t *key)
   = aes_setkey_enc;
 
-static void (*setkey_dec) (uint8_t *rk, const uint8_t *key)
+static __thread void (*setkey_dec) (uint8_t *rk, const uint8_t *key)
   = aes_setkey_dec;
 
 /*
@@ -316,7 +316,7 @@ static void decrypt_cbc( uint8_t* rk,
 static void aeshw_init(void)
 {
 #ifdef HAVE_HARDAES
-  static int done = 0;
+  static __thread int done = 0;
   if (!done) {
     if (aeshw_supported()) {
       encrypt_ecb = aeshw_encrypt_ecb;
@@ -341,7 +341,7 @@ int AES_support_hwaccel(void)
 void AES_CBC_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
   uint8_t iv_tmp[16];
-  static uint8_t rk[AES_RKSIZE];
+  static __thread uint8_t rk[AES_RKSIZE];
 
   assert(iv!=NULL);
   aeshw_init();
@@ -354,7 +354,7 @@ void AES_CBC_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, co
 void AES_CBC_decrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
   uint8_t iv_tmp[16];
-  static uint8_t rk[AES_RKSIZE];
+  static __thread uint8_t rk[AES_RKSIZE];
 
   assert(iv!=NULL);
   aeshw_init();
@@ -368,7 +368,7 @@ void AES_CBC_decrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, co
 
 void AES_ECB_encrypt_buffer(const uint8_t* input, const uint8_t* key, uint8_t* output)
 {
-  static uint8_t rk[AES_RKSIZE];
+  static __thread uint8_t rk[AES_RKSIZE];
 
   aeshw_init();
   if(key!=NULL)
@@ -378,7 +378,7 @@ void AES_ECB_encrypt_buffer(const uint8_t* input, const uint8_t* key, uint8_t* o
 
 void AES_ECB_decrypt_buffer(const uint8_t* input, const uint8_t* key, uint8_t *output)
 {
-  static uint8_t rk[AES_RKSIZE];
+  static __thread uint8_t rk[AES_RKSIZE];
 
   aeshw_init();
   if(key!=NULL)
@@ -433,7 +433,7 @@ static void decrypt_cfb( uint8_t* rk,
 void AES_CFB_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
   uint8_t iv_tmp[16];
-  static uint8_t rk[AES_RKSIZE];
+  static __thread uint8_t rk[AES_RKSIZE];
 
   assert(iv!=NULL);
   aeshw_init();
@@ -447,7 +447,7 @@ void AES_CFB_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, co
 void AES_CFB_decrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
   uint8_t iv_tmp[16];
-  static uint8_t rk[AES_RKSIZE];
+  static __thread uint8_t rk[AES_RKSIZE];
 
   assert(iv!=NULL);
   aeshw_init();

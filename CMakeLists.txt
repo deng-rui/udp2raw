@@ -23,6 +23,7 @@ set(SOURCE_FILES
         client.cpp
         server.cpp
         tcp.cpp
+        packet_sender.cpp
         lib/aes_faster_c/aes.cpp
         lib/aes_faster_c/wrapper.cpp
         my_ev.cpp

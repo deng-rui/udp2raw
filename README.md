@@ -52,6 +52,12 @@ For example, if you use udp2raw + OpenVPN, OpenVPN won't lose connection after a
 ### Other Features
 * **Multiplexing** One client can handle multiple UDP connections, all of which share the same raw connection.
 
+* **Parallel encryption** Linux raw-socket builds can use `--threads N` (`0..64`) to run outgoing packet encryption on a bounded worker queue. The event loop owns connection state, decryption and raw-socket writes. Encrypted packets are consumed in submission order. `0` keeps the original synchronous path; throughput depends on CPU and traffic, so benchmark your workload before choosing a worker count.
+
+* **MTU control** `--mtu N` (`576..1800`, disabled by default) rejects packets whose complete outer IP packet would exceed `N` bytes and caps heartbeat payloads. It does not fragment packets or change the upper VPN's MTU. Set the upper application's datagram limit to the maximum UDP payload reported at startup.
+
+* **Compact FakeTCP** `--compact-tcp` omits FakeTCP timestamps and reduces the data packet TCP header from 32 to 20 bytes (SYN: 40 to 28). Use it on both ends to save bandwidth in both directions; it is incompatible with `--easy-tcp`.
+
 * **Multiple Clients** One server can have multiple clients.
 
 * **NAT Support** All of the 3 modes work in NAT environments.
@@ -87,7 +93,7 @@ Assume your UDP is blocked or being QOS-ed or just poorly supported. Assume your
 Now,an encrypted raw tunnel has been established between client and server through TCP port 4096. Connecting to UDP port 3333 at the client side is equivalent to connecting to port 7777 at the server side. No UDP traffic will be exposed.
 
 ### Note
-To run on Android, check [Android_Guide](https://github.com/wangyu-/udp2raw/wiki/Android-Guide)
+To run on Android, check the [Android guide](doc/android_guide.md).
 
 `-a` option automatically adds an iptables rule (or a few iptables rules) for you, udp2raw relies on this iptables rule to work stably. Be aware you dont forget `-a` (its a common mistake). If you dont want udp2raw to add iptables rule automatically, you can add it manually(take a look at `-g` option) and omit `-a`.
 
@@ -148,11 +154,22 @@ other options:
     --gen-add                             generate iptables rule and add it permanently,then exit.overrides -g
     --keep-rule                           monitor iptables and auto re-add if necessary.implys -a
     --hb-len              <number>        length of heart-beat packet, >=0 and <=1500
+    --mtu                 <number>        outer IP packet limit, 576..1800 bytes, default:disabled
+    --compact-tcp                         omit TCP timestamps, saves 12 bytes per data packet
+    --threads             <number>        Linux encryption workers, 0..64, default:0 (synchronous)
     --mtu-warn            <number>        mtu warning threshold, unit:byte, default:1375
     --clear                               clear any iptables rules added by this program.overrides everything
     --retry-on-error                      retry on error, allow to start udp2raw before network is initialized
     -h,--help                             print this help message
 ```
+
+### Parallel encryption and smaller packets
+
+The design borrows the idea of parallel packet work from [Phantun](https://github.com/dndx/phantun), while retaining udp2raw's raw-socket protocol, encryption and anti-replay checks. It does not implement Phantun's multi-queue TUN transport or its 12-byte total encapsulation overhead.
+
+For example, add `--threads 4 --mtu 1280 --compact-tcp` to each FakeTCP endpoint. With IPv4, AES-CBC and MD5 or HMAC-SHA1, this allows at most 1193 bytes of UDP payload without `--fix-gro`. The same settings with timestamps allow 1177 bytes. The 12-byte header saving may change the payload limit by an AES block because CBC padding is rounded to 16 bytes. IPv6, authentication and GRO framing also affect the limit; use the value reported at startup.
+
+The worker queue holds at most 256 packets, including running and completed work. Queue overflow and failed asynchronous sends drop datagrams and are logged. TCP sequence space is reserved on accepted submission; a later failed send leaves a gap just like a lost packet. Anti-replay numbers remain monotonic and are never reused, including after a dropped submission. Queued packets own snapshots and may still be sent to the previous endpoint during reconnect; they do not retain connection pointers. These options apply to raw modes; real TCP transport does not use this queue or MTU cap.
 
 ### HTTP CONNECT proxy transport
 

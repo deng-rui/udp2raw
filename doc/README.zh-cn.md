@@ -22,11 +22,11 @@ https://github.com/wangyu-/UDPspeeder
 # 支持的平台
 Linux主机，有root权限或cap_net_raw capability.。可以是PC、android手机/平板、openwrt路由器、树莓派。主机上最好安装了iptables命令(apt/yum很容易安装)。
 
-Release中提供了`amd64`、`x86`、`arm`、`mips_be`、`mips_le`的预编译binary.
+GitHub Actions 构建 Linux `x86/x64/ARMv7/ARM64` 和 Windows `x86/x64`，在成功运行的 Artifacts 中下载。Linux 产物静态链接运行库，ARM 产物可用于 root Android 部署；设备仍须支持 raw socket、iptables，并允许相应 SELinux 操作。产物与验证范围见[构建指南](build_guide.md)。
 
-##### 对于windows和mac用户：
+##### 对于 Windows 和 macOS 用户：
 
-可以用[这个repo](https://github.com/wangyu-/udp2raw-multiplatform)里的udp2raw。
+Windows 可使用 Actions 中的 `.exe`，raw 模式需要管理员权限和 Npcap。macOS 用户可以用[这个 repo](https://github.com/wangyu-/udp2raw-multiplatform)里的 udp2raw。
 
 ##### 对于ios和游戏主机用户：
 
@@ -89,7 +89,15 @@ https://github.com/wangyu-/udp2raw-tunnel/releases
 
 ### MTU设置(重要)
 
-不论你用udp2raw来加速kcptun还是vpn,为了稳定使用,都需要设置合理的MTU（在kcptun/vpn里设置，而不是在udp2raw里），建议把MTU设置成1200。client和server端都要设置。
+`--mtu N` 限制完整外层 IP 包大小，范围 `576..1800`，默认关闭。加密填充、认证、IP 和传输头都计入限制；超限数据报直接丢弃，心跳长度自动缩小。它不会自动分片或修改 VPN 接口 MTU，需要根据启动日志的 `maximum UDP payload` 调小上层应用的数据报大小。
+
+`--compact-tcp` 省略 FakeTCP 时间戳，使数据包 TCP 头从 32 字节降到 20 字节，SYN 头从 40 字节降到 28 字节。建议两端开启，以便双向节省开销；不能与 `--easy-tcp` 一起使用。IPv4、AES-CBC、MD5 或 HMAC-SHA1、不启用 `--fix-gro` 时，`--mtu 1280 --compact-tcp` 最多承载 1193 字节 UDP 数据；保留时间戳时为 1177 字节。
+
+### 并行加密
+
+Linux raw 模式可使用 `--threads N`，范围 `0..64`，默认 `0` 为原有同步路径。工作线程只处理发送加密，连接状态、接收解密和 raw socket 发送仍由主循环持有。队列最多容纳 256 个任务，按提交顺序发送；过载或异步发送失败会丢包并记录日志。参数可先用 `--threads 4 --mtu 1280 --compact-tcp`，再根据设备实测调整线程数，不能据此保证固定吞吐提升。
+
+此实现借鉴 Phantun 的并行处理思路，保留 udp2raw 加密、防重放与 raw 协议，不等同于 Phantun 的多队列 TUN，也不是总封装开销只有 12 字节。上述选项不适用于真实 TCP 传输模式。
 
 ### 提醒
 `--cipher-mode xor`表示仅使用简单的XOR加密，这样可以节省CPU占用，以免CPU成为速度瓶颈。如果你需要更强的加密，可以去掉此选项，使用默认的AES加密。加密相关的选项见后文的`--cipher-mode`和`--auth-mode`。
@@ -111,7 +119,7 @@ usage:
     run as server : ./this_program -s -l server_listen_ip:server_port -r remote_address:remote_port  [options]
 
 common options,these options must be same on both side:
-    --raw-mode            <string>        available values:faketcp(default),udp,icmp and easy-faketcp
+    --raw-mode            <string>        available values:faketcp(default),udp,icmp,easy-faketcp,tcp
     -k,--key              <string>        password to gen symetric key,default:"secret key"
     --cipher-mode         <string>        available values:aes128cfb,aes128cbc(default),xor,none
     --auth-mode           <string>        available values:hmac_sha1,md5(default),crc32,simple,none
@@ -122,6 +130,8 @@ common options,these options must be same on both side:
     --fix-gro                             try to fix huge packet caused by GRO. this option is at an early stage.
                                           make sure client and server are at same version.
 client options:
+    --http-proxy          <host:port>     HTTP CONNECT proxy，仅 TCP 模式客户端可用
+    --http-proxy-auth     <user:password> HTTP 代理 Basic 认证
     --source-ip           <ip>            force source-ip for raw socket
     --source-port         <port>          force source-port for raw socket,tcp/udp only
                                           this option disables port changing while re-connecting
@@ -153,6 +163,9 @@ other options:
     --gen-add                             generate iptables rule and add it permanently,then exit.overrides -g
     --keep-rule                           monitor iptables and auto re-add if necessary.implys -a
     --hb-len              <number>        length of heart-beat packet, >=0 and <=1500
+    --mtu                 <number>        outer IP packet limit, 576..1800 bytes, default:disabled
+    --compact-tcp                         omit TCP timestamps, saves 12 bytes per data packet
+    --threads             <number>        Linux encryption workers, 0..64, default:0 (synchronous)
     --mtu-warn            <number>        mtu warning threshold, unit:byte, default:1375
     --clear                               clear any iptables rules added by this program.overrides everything
     --retry-on-error                      retry on error, allow to start udp2raw before network is initialized

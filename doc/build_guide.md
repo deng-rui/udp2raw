@@ -2,6 +2,36 @@
 
 the guide on how to build udp2raw
 
+## GitHub Actions builds
+
+The repository workflow `.github/workflows/build.yml` runs on pushes, pull requests and manual dispatches. It builds the following targets on Ubuntu runners; no local compiler is required:
+
+| Artifact | Architecture | Toolchain |
+| --- | --- | --- |
+| `udp2raw-linux-amd64` | Linux x86_64 | Zig 0.14.1, musl |
+| `udp2raw-linux-x86` | Linux x86 (32-bit) | Zig 0.14.1, musl |
+| `udp2raw-linux-arm` | Linux ARMv7 | Zig 0.14.1, musl |
+| `udp2raw-linux-armv8` | Linux ARM64 / ARMv8 | Zig 0.14.1, musl |
+| `udp2raw-windows-x86` | Windows x86 (32-bit) | MinGW-w64 POSIX |
+| `udp2raw-windows-x64` | Windows x64 | MinGW-w64 POSIX |
+
+Download artifacts from the completed run. Linux artifacts contain a static executable, a `.tar.gz` preserving its executable permission, and SHA256 sums. Windows artifacts contain an `.exe` and SHA256 sums. The workflow uploads artifacts; it does not publish GitHub Releases. Linux ARM binaries are intended for rooted Android too; see the [Android guide](android_guide.md) for kernel and permission requirements. Windows still requires Npcap for raw modes, even though its C++ and thread runtimes are statically linked.
+
+CI checks ELF/PE architecture and runtime linkage, runs `--help` natively or under QEMU for Linux targets, and runs software/accelerated AES and worker queue tests on Linux x86_64. The x86_64 binary also runs UDP round trips, ordering, MTU rejection and wire-header checks inside a private network namespace. The TCP transport test runs for each Linux binary (with QEMU where needed) and on both Windows runners. Windows raw networking and Android hardware are not exercised by CI.
+
+## Optional local static build
+
+With Zig 0.14.1 installed, the same Linux build can be run from Bash:
+
+```bash
+bash scripts/build-static.sh arm64 build/arm64
+bash scripts/build-static.sh armv7 build/armv7
+bash scripts/build-static.sh amd64 build/amd64
+bash scripts/build-static.sh x86 build/x86
+```
+
+Set `ZIG=/path/to/zig` when Zig is not on `PATH`. The script defaults to ARM64 and outputs `build/udp2raw_arm64`. It deliberately keeps assertions enabled because existing initialization code has side effects inside assertions.
+
 ## Build udp2raw for a specific platform
 
 ### linux platform which supports local compile

@@ -12,6 +12,8 @@
 #include "connection.h"
 #include "fd_manager.h"
 #include "tcp.h"
+#include "packet_sender.h"
+#include "packet_size.h"
 
 int hb_mode = 1;
 int hb_len = 1200;
@@ -192,6 +194,9 @@ void print_help() {
     printf("    --keep-rule                           monitor iptables and auto re-add if necessary.implys -a\n");
     printf("    --hb-len              <number>        length of heart-beat packet, >=0 and <=1500\n");
     printf("    --mtu-warn            <number>        mtu warning threshold, unit:byte, default:1375\n");
+    printf("    --mtu                 <number>        outer IP packet limit, 576..1800 bytes, default:disabled\n");
+    printf("    --compact-tcp                         omit TCP timestamps, saves 12 bytes per data packet\n");
+    printf("    --threads             <number>        Linux encryption workers, 0..64, default:0 (synchronous)\n");
     printf("    --clear                               clear any iptables rules added by this program.overrides everything\n");
     printf("    --retry-on-error                      retry on error, allow to start udp2raw before network is initialized\n");
     printf("    -h,--help                             print this help message\n");
@@ -290,6 +295,9 @@ void process_arg(int argc, char *argv[])  // process all options
             {"hb-mode", required_argument, 0, 1},
             {"hb-len", required_argument, 0, 1},
             {"mtu-warn", required_argument, 0, 1},
+            {"mtu", required_argument, 0, 1},
+            {"compact-tcp", no_argument, 0, 1},
+            {"threads", required_argument, 0, 1},
             {"max-rst-to-show", required_argument, 0, 1},
             {"max-rst-allowed", required_argument, 0, 1},
             {"set-ttl", required_argument, 0, 1},
@@ -654,6 +662,18 @@ void process_arg(int argc, char *argv[])  // process all options
                     sscanf(optarg, "%d", &hb_len);
                     assert(hb_len >= 0 && hb_len <= 1500);
                     mylog(log_info, "hb_len =%d \n", hb_len);
+                } else if (strcmp(long_options[option_index].name, "threads") == 0) {
+                    if (!parse_bounded_decimal(optarg, 0, 64, packet_threads)) {
+                        mylog(log_fatal, "--threads must be an integer in 0..64\n");
+                        myexit(-1);
+                    }
+                } else if (strcmp(long_options[option_index].name, "mtu") == 0) {
+                    if (!parse_bounded_decimal(optarg, 576, max_data_len, path_mtu)) {
+                        mylog(log_fatal, "--mtu must be an integer in 576..%d\n", max_data_len);
+                        myexit(-1);
+                    }
+                } else if (strcmp(long_options[option_index].name, "compact-tcp") == 0) {
+                    compact_tcp = 1;
                 } else if (strcmp(long_options[option_index].name, "mtu-warn") == 0) {
                     sscanf(optarg, "%d", &mtu_warn);
                     assert(mtu_warn > 0);

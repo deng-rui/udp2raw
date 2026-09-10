@@ -3,7 +3,7 @@
 
 //#include "aes.h"
 //#include "md5.h"
-#include "common.h"
+#include <unordered_map>
 
 // using namespace std;
 // extern char key[16];
@@ -15,6 +15,7 @@ int my_init_keys(const char *, int);
 
 int my_encrypt(const char *data, char *output, int &len);
 int my_decrypt(const char *data, char *output, int &len);
+int encrypt_safer_payload(const char *data, char *output, int &len);
 
 unsigned short csum(const unsigned short *ptr, int nbytes);
 
@@ -34,8 +35,8 @@ enum cipher_mode_t { cipher_none = 0,
 extern auth_mode_t auth_mode;
 extern cipher_mode_t cipher_mode;
 
-extern unordered_map<int, const char *> auth_mode_tostring;
-extern unordered_map<int, const char *> cipher_mode_tostring;
+extern std::unordered_map<int, const char *> auth_mode_tostring;
+extern std::unordered_map<int, const char *> cipher_mode_tostring;
 
 extern char gro_xor[256 + 100];
 

@@ -8,6 +8,8 @@
 #include "connection.h"
 #include "encrypt.h"
 #include "fd_manager.h"
+#include "packet_sender.h"
+#include "packet_size.h"
 
 int disable_anti_replay = 0;  // if anti_replay windows is diabled
 
@@ -400,6 +402,14 @@ int send_safer(conn_info_t &conn_info, char type, const char *data, int len)  //
         return -1;
     }
 
+    if (!safer_fits_mtu(len)) {
+        static u64_t mtu_drops = 0;
+        ++mtu_drops;
+        if ((mtu_drops & (mtu_drops - 1)) == 0)
+            mylog(log_warn, "packet exceeds outer MTU or receive limit, payload=%d, dropped=%llu\n", len, mtu_drops);
+        return -1;
+    }
+
     char send_data_buf[buf_len];  // buf for send data and send hb
     char send_data_buf2[buf_len];
 
@@ -422,23 +432,14 @@ int send_safer(conn_info_t &conn_info, char type, const char *data, int len)  //
 
     int new_len = len + sizeof(n_seq) + sizeof(n_tmp_id) * 2 + 2;
 
-    if (g_fix_gro == 0) {
-        if (my_encrypt(send_data_buf, send_data_buf2, new_len) != 0) {
-            return -1;
-        }
-    } else {
-        if (my_encrypt(send_data_buf, send_data_buf2 + 2, new_len) != 0) {
-            return -1;
-        }
-        write_u16(send_data_buf2, new_len);
-        new_len += 2;
-        if (cipher_mode == cipher_xor) {
-            send_data_buf2[0] ^= gro_xor[0];
-            send_data_buf2[1] ^= gro_xor[1];
-        } else if (cipher_mode == cipher_aes128cbc || cipher_mode == cipher_aes128cfb) {
-            aes_ecb_encrypt1(send_data_buf2);
-        }
+    if (packet_sender_enabled()) {
+        // 入队时预留序号；任务只持有值快照，重连或回收连接不会产生悬空引用。
+        if (queue_safer_packet(conn_info.raw_info, send_data_buf, new_len) != 0) return -1;
+        send_info.data_len = safer_cipher_size(new_len);
+        return after_send_raw0(conn_info.raw_info);
     }
+
+    if (encrypt_safer_payload(send_data_buf, send_data_buf2, new_len) != 0) return -1;
 
     if (send_raw0(conn_info.raw_info, send_data_buf2, new_len) != 0) return -1;
 
@@ -448,6 +449,7 @@ int send_safer(conn_info_t &conn_info, char type, const char *data, int len)  //
 }
 int send_data_safer(conn_info_t &conn_info, const char *data, int len, u32_t conv_num)  // a wrap for  send_safer for transfer data.
 {
+    if (len < 0 || len > max_data_len - conversation_header_size) return -1;
     packet_info_t &send_info = conn_info.raw_info.send_info;
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
 
@@ -458,8 +460,7 @@ int send_data_safer(conn_info_t &conn_info, const char *data, int len, u32_t con
 
     memcpy(send_data_buf + sizeof(n_conv_num), data, len);
     int new_len = len + sizeof(n_conv_num);
-    send_safer(conn_info, 'd', send_data_buf, new_len);
-    return 0;
+    return send_safer(conn_info, 'd', send_data_buf, new_len);
 }
 int reserved_parse_safer(conn_info_t &conn_info, const char *input, int input_len, char &type, char *&data, int &len)  // subfunction for recv_safer,allow overlap
 {

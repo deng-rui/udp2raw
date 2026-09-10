@@ -291,7 +291,8 @@ int de_padding(const char *data, int &data_len, int padding_num) {
     return 0;
 }
 void aes_ecb_encrypt(const char *data, char *output) {
-    static int first_time = 1;
+    // 缓存初始化标记与底层密钥上下文必须同时按线程隔离。
+    static thread_local int first_time = 1;
     char *key = (char *)cipher_key_encrypt;
     if (aes_key_optimize) {
         if (first_time == 0)
@@ -307,7 +308,7 @@ void aes_ecb_encrypt1(char *data) {
     aes_ecb_encrypt(buf, data);
 }
 void aes_ecb_decrypt(const char *data, char *output) {
-    static int first_time = 1;
+    static thread_local int first_time = 1;
     char *key = (char *)cipher_key_decrypt;
     if (aes_key_optimize) {
         if (first_time == 0)
@@ -323,7 +324,7 @@ void aes_ecb_decrypt1(char *data) {
     aes_ecb_decrypt(buf, data);
 }
 int cipher_aes128cbc_encrypt(const char *data, char *output, int &len, char *key) {
-    static int first_time = 1;
+    static thread_local int first_time = 1;
 
     char buf[buf_len];
     memcpy(buf, data, len);  // TODO inefficient code
@@ -341,7 +342,7 @@ int cipher_aes128cbc_encrypt(const char *data, char *output, int &len, char *key
     return 0;
 }
 int cipher_aes128cfb_encrypt(const char *data, char *output, int &len, char *key) {
-    static int first_time = 1;
+    static thread_local int first_time = 1;
     assert(len >= 16);
 
     char buf[buf_len];
@@ -379,7 +380,7 @@ int cipher_none_encrypt(const char *data, char *output, int &len, char *key) {
     return 0;
 }
 int cipher_aes128cbc_decrypt(const char *data, char *output, int &len, char *key) {
-    static int first_time = 1;
+    static thread_local int first_time = 1;
     if (len % 16 != 0) {
         mylog(log_debug, "len%%16!=0\n");
         return -1;
@@ -395,7 +396,7 @@ int cipher_aes128cbc_decrypt(const char *data, char *output, int &len, char *key
     return 0;
 }
 int cipher_aes128cfb_decrypt(const char *data, char *output, int &len, char *key) {
-    static int first_time = 1;
+    static thread_local int first_time = 1;
     if (len < 16) return -1;
 
     if (aes_key_optimize) {
@@ -574,6 +575,20 @@ int my_decrypt(const char *data, char *output, int &len /*,char * key*/) {
         return -1;
     }
 
+    return 0;
+}
+
+int encrypt_safer_payload(const char *data, char *output, int &len) {
+    if (!g_fix_gro) return my_encrypt(data, output, len);
+    if (my_encrypt(data, output + 2, len) != 0) return -1;
+    write_u16(output, len);
+    len += 2;
+    if (cipher_mode == cipher_xor) {
+        output[0] ^= gro_xor[0];
+        output[1] ^= gro_xor[1];
+    } else if (cipher_mode == cipher_aes128cbc || cipher_mode == cipher_aes128cfb) {
+        aes_ecb_encrypt1(output);
+    }
     return 0;
 }
 

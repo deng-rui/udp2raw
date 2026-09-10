@@ -1,5 +1,8 @@
 #include "log.h"
 #include "misc.h"
+#include <mutex>
+
+static std::mutex log_mutex;
 
 int log_level = log_info;
 
@@ -9,6 +12,7 @@ int enable_log_color = 1;
 void log0(const char* file, const char* function, int line, int level, const char* str, ...) {
     if (level > log_level) return;
     if (level > log_trace || level < 0) return;
+    std::lock_guard<std::mutex> lock(log_mutex);
 
     time_t timer;
     char buffer[100];
@@ -45,6 +49,7 @@ void log0(const char* file, const char* function, int line, int level, const cha
 void log_bare(int level, const char* str, ...) {
     if (level > log_level) return;
     if (level > log_trace || level < 0) return;
+    std::lock_guard<std::mutex> lock(log_mutex);
     if (enable_log_color)
         printf("%s", log_color[level]);
     va_list vlist;

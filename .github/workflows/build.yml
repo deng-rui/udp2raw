@@ -1,0 +1,202 @@
+name: Build udp2raw
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            machine: Advanced Micro Devices X86-64
+            emulator: ''
+            artifact: udp2raw-linux-amd64
+          - arch: x86
+            machine: Intel 80386
+            emulator: qemu-i386
+            artifact: udp2raw-linux-x86
+          - arch: armv7
+            machine: ARM
+            emulator: qemu-arm
+            artifact: udp2raw-linux-arm
+          - arch: arm64
+            machine: AArch64
+            emulator: qemu-aarch64
+            artifact: udp2raw-linux-armv8
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+          cache-key: ${{ matrix.arch }}
+      - name: Install emulator
+        if: matrix.emulator != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+      - name: Build static binary
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mkdir -p dist
+          bash scripts/build-static.sh "$ARCH" build
+          cp "build/udp2raw_$ARCH" "dist/$ARTIFACT"
+          tar -C dist -czf "dist/$ARTIFACT.tar.gz" "$ARTIFACT"
+          sha256sum "dist/$ARTIFACT" "dist/$ARTIFACT.tar.gz" > "dist/$ARTIFACT.sha256"
+      - name: Verify ELF and startup
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          MACHINE: ${{ matrix.machine }}
+          EMULATOR: ${{ matrix.emulator }}
+        run: |
+          binary="dist/$ARTIFACT"
+          readelf -h "$binary" | tee build/elf-header.txt
+          grep -F "Machine:" build/elf-header.txt | grep -F "$MACHINE"
+          readelf -l "$binary" > build/elf-program.txt
+          readelf -d "$binary" > build/elf-dynamic.txt
+          if grep -Eq 'INTERP' build/elf-program.txt || grep -Eq 'NEEDED' build/elf-dynamic.txt; then
+            echo 'Expected a static binary with no interpreter or shared libraries' >&2
+            exit 1
+          fi
+          if [[ -n "$EMULATOR" ]]; then
+            timeout 30 "$EMULATOR" "$binary" --help
+          else
+            timeout 30 "$binary" --help
+          fi
+      - name: Test HTTP proxy transport
+        env:
+          UDP2RAW_TEST_RUNNER: ${{ matrix.emulator }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: python3 tests/test_tcp_transport.py "dist/$ARTIFACT"
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            artifact: udp2raw-windows-x86.exe
+            target: i686-w64-mingw32
+            package: g++-mingw-w64-i686-posix
+            format: pei-i386
+          - arch: x64
+            artifact: udp2raw-windows-x64.exe
+            target: x86_64-w64-mingw32
+            package: g++-mingw-w64-x86-64-posix
+            format: pei-x86-64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW toolchain
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "$PACKAGE"
+      - name: Build Windows binary
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mkdir -p dist
+          make mingw_cross cc_mingw_cross="$TARGET-g++-posix" OPT='-UNDEBUG -D_WIN32_WINNT=0x0601 -Wno-narrowing'
+          "$TARGET-strip" udp2raw_mp.exe
+          cp udp2raw_mp.exe "dist/$ARTIFACT"
+          sha256sum "dist/$ARTIFACT" > "dist/$ARTIFACT.sha256"
+      - name: Verify PE and runtime linkage
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          FORMAT: ${{ matrix.format }}
+        run: |
+          "$TARGET-objdump" -f "dist/$ARTIFACT" | tee pe-header.txt
+          grep -F "file format $FORMAT" pe-header.txt
+          "$TARGET-objdump" -p "dist/$ARTIFACT" > pe-imports.txt
+          if grep -Ei 'DLL Name:.*(libstdc\+\+|libgcc|libwinpthread)' pe-imports.txt; then
+            echo 'C++ and pthread runtimes must be linked statically' >&2
+            exit 1
+          fi
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: udp2raw-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows-tcp-test:
+    name: Windows TCP ${{ matrix.arch }}
+    needs: windows
+    runs-on: windows-2025
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: udp2raw-windows-${{ matrix.arch }}
+          path: dist
+      - name: Test HTTP proxy transport without a capture driver
+        shell: pwsh
+        run: python tests/test_tcp_transport.py 'dist/udp2raw-windows-${{ matrix.arch }}.exe'
+
+  test:
+    name: Packet and raw-socket regression
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: udp2raw-linux-amd64
+          path: dist
+      - name: Test software and accelerated AES workers
+        run: |
+          g++ -std=c++11 -O2 -UNDEBUG -pthread -I. tests/packet_tests.cpp \
+            lib/aes_faster_c/aes.cpp lib/aes_faster_c/wrapper.cpp -o packet_tests
+          timeout 60 ./packet_tests
+          g++ -std=c++11 -O2 -UNDEBUG -pthread -I. tests/packet_tests.cpp \
+            lib/aes_acc/aes*.c lib/aes_acc/asm/x64.S -o packet_tests_acc
+          timeout 60 ./packet_tests_acc
+      - name: Install isolated network test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iproute2 iptables
+      - name: Test raw transport in a private network namespace
+        run: |
+          tar -xzf dist/udp2raw-linux-amd64.tar.gz -C dist
+          sudo unshare --net -- bash -euc 'ip link set lo up; exec python3 tests/test_raw_transport.py dist/udp2raw-linux-amd64'

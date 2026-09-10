@@ -8,6 +8,8 @@
 #include "network.h"
 #include "log.h"
 #include "misc.h"
+#include "packet_sender.h"
+#include "packet_size.h"
 
 int g_fix_gro = 0;
 
@@ -445,7 +447,7 @@ int init_raw_socket() {
             bind_address.sll_protocol = htons(ETH_P_IPV6);
         bind_address.sll_ifindex = index;
 
-        if (bind(raw_recv_fd, (struct sockaddr *)&bind_address, sizeof(bind_address)) == -1) {
+        if (::bind(raw_recv_fd, (struct sockaddr *)&bind_address, sizeof(bind_address)) == -1) {
             mylog(log_fatal, "bind to dev [%s] failed\n", dev);
             myexit(1);
         }
@@ -1164,6 +1166,8 @@ int send_raw_ip(raw_info_t &raw_info, const char *payload, int payloadlen) {
     const packet_info_t &recv_info = raw_info.recv_info;
     char send_raw_ip_buf[buf_len];
 
+    if (path_mtu && payloadlen + (raw_ip_version == AF_INET ? 20 : 40) > path_mtu) return -1;
+
     if (raw_info.disabled) {
         mylog(log_debug, "[%s,%d]connection disabled, no packet will be sent\n", recv_info.new_src_ip.get_str1(), recv_info.src_port);
         assert(max_rst_allowed >= 0);
@@ -1643,7 +1647,14 @@ int send_raw_tcp(raw_info_t &raw_info, const char *payload, int payloadlen) {  /
     tcph->psh = send_info.psh;
     tcph->ack = send_info.ack;
 
-    if (tcph->syn == 1) {
+    if (compact_tcp) {
+        // 不协商时间戳，数据包可使用 20 字节 TCP 头；仍保留 MSS 和窗口缩放。
+        tcph->doff = tcp_header_size(tcph->syn, true) / 4;
+        if (tcph->syn) {
+            const unsigned char options[] = {2, 4, 5, 0xb4, 1, 3, 3, wscale};
+            memcpy(send_raw_tcp_buf + sizeof(my_tcphdr), options, sizeof(options));
+        }
+    } else if (tcph->syn == 1) {
         tcph->doff = 10;  // tcp header size
         int i = sizeof(my_tcphdr);
         send_raw_tcp_buf[i++] = 0x02;  // mss

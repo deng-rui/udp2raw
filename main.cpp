@@ -7,6 +7,7 @@
 #include "encrypt.h"
 #include "fd_manager.h"
 #include "tcp.h"
+#include "packet_sender.h"
 
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents) {
     mylog(log_info, "got sigpipe, ignored");
@@ -40,6 +41,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     pre_process_arg(argc, argv);
+    configure_packet_sender();
 
     ev_signal signal_watcher_sigpipe;
     ev_signal signal_watcher_sigterm;
@@ -98,6 +100,7 @@ int main(int argc, char *argv[]) {
 #ifdef UDP2RAW_LINUX
     init_raw_socket();
 #endif
+    init_packet_sender();
 
     if (program_mode == client_mode) {
         client_event_loop();
@@ -110,5 +113,6 @@ int main(int argc, char *argv[]) {
 #endif
     }
 
+    stop_packet_sender();
     return 0;
 }

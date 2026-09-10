@@ -14,7 +14,7 @@
 
 void AES_ECB_encrypt_buffer(const uint8_t* input, const uint8_t* key, uint8_t *output)
 {
-	static aes_context ctx;
+	static thread_local aes_context ctx;
 	if(key!=0)
 	{
 		aes_init( &ctx);
@@ -26,7 +26,7 @@ void AES_ECB_encrypt_buffer(const uint8_t* input, const uint8_t* key, uint8_t *o
 }
 void AES_ECB_decrypt_buffer(const uint8_t* input, const uint8_t* key, uint8_t *output)
 {
-	static aes_context ctx;
+	static thread_local aes_context ctx;
 	if(key!=0)
 	{
 		aes_init( &ctx);
@@ -39,7 +39,7 @@ void AES_ECB_decrypt_buffer(const uint8_t* input, const uint8_t* key, uint8_t *o
 
 void AES_CBC_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
-	static aes_context ctx;
+	static thread_local aes_context ctx;
 
 	char tmp_iv[16];
 	if(key!=0)
@@ -54,7 +54,7 @@ void AES_CBC_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, co
 }
 void AES_CBC_decrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
-	static aes_context ctx;
+	static thread_local aes_context ctx;
 
 	char tmp_iv[16];
 	if(key!=0)
@@ -69,7 +69,7 @@ void AES_CBC_decrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, co
 
 void AES_CFB_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
-	static aes_context ctx;
+	static thread_local aes_context ctx;
 
 	char tmp_iv[16];
 	if(key!=0)
@@ -85,7 +85,7 @@ void AES_CFB_encrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, co
 }
 void AES_CFB_decrypt_buffer(uint8_t* output, uint8_t* input, uint32_t length, const uint8_t* key, const uint8_t* iv)
 {
-	static aes_context ctx;
+	static thread_local aes_context ctx;
 
 	char tmp_iv[16];
 	if(key!=0)

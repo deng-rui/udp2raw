@@ -6,6 +6,7 @@
 #include "lib/md5.h"
 #include "encrypt.h"
 #include "fd_manager.h"
+#include "packet_sender.h"
 
 #ifdef UDP2RAW_MP
 u32_t detect_interval = 1500;
@@ -637,6 +638,12 @@ void fifo_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
         mylog(log_info, "unknown command\n");
     }
 }
+#ifdef UDP2RAW_LINUX
+void packet_send_cb(struct ev_loop *, struct ev_io *, int) {
+    drain_packet_sender();
+}
+#endif
+
 int client_event_loop() {
     char buf[buf_len];
 
@@ -856,6 +863,12 @@ int client_event_loop() {
     raw_recv_watcher.data = &conn_info;
     ev_io_init(&raw_recv_watcher, raw_recv_cb, raw_recv_fd, EV_READ);
     ev_io_start(loop, &raw_recv_watcher);
+
+    struct ev_io packet_send_watcher;
+    if (packet_sender_fd() >= 0) {
+        ev_io_init(&packet_send_watcher, packet_send_cb, packet_sender_fd(), EV_READ);
+        ev_io_start(loop, &packet_send_watcher);
+    }
 #endif
 
 #ifdef UDP2RAW_MP

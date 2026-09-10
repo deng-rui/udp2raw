@@ -36,8 +36,8 @@
  */
 int aesarm_supported( void )
 {
-    static int done = 0;
-    static unsigned int c = 0;
+    static __thread int done = 0;
+    static __thread unsigned int c = 0;
 
     if ( ! done )
     {

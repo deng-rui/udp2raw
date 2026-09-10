@@ -15,6 +15,7 @@
 #include "lib/md5.h"
 #include "encrypt.h"
 #include "fd_manager.h"
+#include "packet_sender.h"
 
 int server_on_timer_multi(conn_info_t &conn_info)  // for server. called when a timer is ready in epoll.for server,there will be one timer for every connection
 // there is also a global timer for server,but its not handled here
@@ -650,7 +651,7 @@ int server_event_loop() {
     // temp_bind_addr.sin_port = local_addr.get_port();
     // temp_bind_addr.sin_addr.s_addr = local_addr.inner.ipv4.sin_addr.s_addr;
 
-    if (bind(bind_fd, (struct sockaddr *)&local_addr.inner, local_addr.get_len()) != 0) {
+    if (::bind(bind_fd, (struct sockaddr *)&local_addr.inner, local_addr.get_len()) != 0) {
         mylog(log_fatal, "bind fail\n");
         myexit(-1);
     }
@@ -681,6 +682,14 @@ int server_event_loop() {
     if (ret != 0) {
         mylog(log_fatal, "add raw_fd error\n");
         myexit(-1);
+    }
+    if (packet_sender_fd() >= 0) {
+        ev.events = EPOLLIN;
+        ev.data.u64 = packet_sender_fd();
+        if (epoll_ctl(epollfd, EPOLL_CTL_ADD, packet_sender_fd(), &ev) != 0) {
+            mylog(log_fatal, "add packet completion fd failed: %s\n", strerror(errno));
+            myexit(-1);
+        }
     }
     int timer_fd;
 
@@ -739,6 +748,8 @@ int server_event_loop() {
                 mylog(log_trace, "epoll_trigger_counter:  %d \n", epoll_trigger_counter);
                 epoll_trigger_counter = 0;
 
+            } else if (events[idx].data.u64 == (u64_t)packet_sender_fd()) {
+                drain_packet_sender();
             } else if (events[idx].data.u64 == (u64_t)raw_recv_fd) {
                 if (debug_flag) begin_time = get_current_time();
                 server_on_raw_recv_multi();

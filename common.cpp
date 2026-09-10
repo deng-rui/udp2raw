@@ -8,6 +8,7 @@
 #include "common.h"
 #include "log.h"
 #include "misc.h"
+#include "packet_sender.h"
 
 #include <random>
 #include <cmath>
@@ -792,6 +793,7 @@ bool larger_than_u16(uint16_t a, uint16_t b) {
 }
 
 void myexit(int a) {
+    stop_packet_sender();
     if (enable_log_color)
         printf("%s\n", RESET);
 #ifdef UDP2RAW_LINUX
