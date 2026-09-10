@@ -20,7 +20,13 @@ or
 # Support Platforms
 Linux host (including desktop Linux,Android phone/tablet,OpenWRT router,or Raspberry PI) with root account or cap_net_raw capability.
 
-For Windows and MacOS users, use the udp2raw in [this repo](https://github.com/wangyu-/udp2raw-multiplatform).
+GitHub Actions builds single-file binaries for Linux `x86_64`, `x86`, ARMv7
+(hard-float) and ARMv8 (ARM64), plus Windows `x86` and `x64`. Download the matching
+artifact from a successful **Build HTTP transport binaries** workflow run. TCP mode works on
+Linux and Windows without raw-socket privileges or WinPcap/Npcap.
+
+Windows raw modes still require WinPcap/Npcap and support client mode only.
+For MacOS, use the udp2raw in [this repo](https://github.com/wangyu-/udp2raw-multiplatform).
 
 # Features
 ### Send/Receive UDP Packets with ICMP/FakeTCP/UDP headers
@@ -98,7 +104,7 @@ usage:
     run as server : ./this_program -s -l server_listen_ip:server_port -r remote_address:remote_port  [options]
 
 common options,these options must be same on both side:
-    --raw-mode            <string>        available values:faketcp(default),udp,icmp and easy-faketcp
+    --raw-mode            <string>        available values:faketcp(default),udp,icmp,easy-faketcp,tcp
     -k,--key              <string>        password to gen symetric key,default:"secret key"
     --cipher-mode         <string>        available values:aes128cfb,aes128cbc(default),xor,none
     --auth-mode           <string>        available values:hmac_sha1,md5(default),crc32,simple,none
@@ -112,6 +118,8 @@ client options:
     --source-ip           <ip>            force source-ip for raw socket
     --source-port         <port>          force source-port for raw socket,tcp/udp only
                                           this option disables port changing while re-connecting
+    --http-proxy          <host:port>     client tcp mode: establish the tunnel with HTTP CONNECT
+    --http-proxy-auth     <user:password> client tcp mode: send Proxy-Authorization Basic
 other options:
     --conf-file           <string>        read options from a configuration file instead of command line.
                                           check example.conf in repo for format
@@ -145,6 +153,48 @@ other options:
     --retry-on-error                      retry on error, allow to start udp2raw before network is initialized
     -h,--help                             print this help message
 ```
+
+### HTTP CONNECT proxy transport
+
+`--raw-mode tcp` uses a normal encrypted TCP stream instead of raw sockets. It
+is useful when the client can reach only an HTTP proxy. Run both endpoints in
+TCP mode; add `--http-proxy` and, when required, `--http-proxy-auth` only on the
+client. With AES enabled, the proxy sees the destination and encrypted stream,
+but cannot read the UDP payload. Basic proxy credentials are sent to the proxy
+without TLS; use a trusted proxy connection.
+
+```bash
+# server
+./udp2raw -s -l 0.0.0.0:4096 -r 127.0.0.1:7777 --raw-mode tcp -k passwd --auth-mode hmac_sha1
+
+# client, local UDP is exposed on 127.0.0.1:3333
+./udp2raw -c -l 127.0.0.1:3333 -r 44.55.66.77:4096 --raw-mode tcp \
+  --http-proxy 10.0.0.2:8080 --http-proxy-auth proxy-user:proxy-password \
+  -k passwd --auth-mode hmac_sha1
+```
+
+The client accepts `host:port`, `http://host:port`, and bracketed IPv6 proxy
+addresses such as `http://[2001:db8::2]:8080`. HTTPS proxies, proxy URLs with
+embedded credentials, and proxy-side DNS are intentionally unsupported.
+
+Use the downloaded executable name in place of `./udp2raw` (on Windows, for
+example, `.\udp2raw-windows-x64.exe`). The proxy must permit CONNECT to the
+server's TCP port. Both ends require this version and matching key, cipher and
+auth modes. Do not use `-a`, `-g` or `--easy-tcp` with TCP mode.
+
+TCP mode preserves UDP datagram boundaries up to 65507 bytes and reconnects
+automatically. UDP packets sent while disconnected or when the send queue is
+full are dropped. Reconnection creates new server-side UDP sockets, so an
+application tied to the old UDP source port may need to reconnect. Unlike
+FakeTCP, real TCP retransmits and delivers in order, which can increase latency
+on lossy links.
+
+The workflow runs `tests/test_tcp_transport.py` against each Linux binary (with
+QEMU for Linux ARM targets) and on both Windows runners, covering proxy
+authentication, framing, IPv6, multiple peers, reconnection and malformed or
+replayed records. Pushes, pull requests and manual `workflow_dispatch` runs
+trigger the build; the workflow uploads run artifacts and does not publish
+GitHub Releases.
 
 ### Iptables rules,`-a` and `-g`
 This program sends packets via raw socket. In FakeTCP mode, Linux kernel TCP packet processing has to be blocked by a iptables rule on both sides, otherwise the kernel will automatically send RST for an unrecongized TCP packet and you will sustain from stability / peformance problems. You can use `-a` option to let the program automatically add / delete iptables rule on start / exit. You can also use the `-g` option to generate iptables rule and add it manually.

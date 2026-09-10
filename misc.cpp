@@ -11,6 +11,7 @@
 #include "network.h"
 #include "connection.h"
 #include "fd_manager.h"
+#include "tcp.h"
 
 int hb_mode = 1;
 int hb_len = 1200;
@@ -82,7 +83,7 @@ int iptables_rule_keep_index = 0;
 program_mode_t program_mode = unset_mode;  // 0 unset; 1client 2server
 raw_mode_t raw_mode = mode_faketcp;
 u32_t raw_ip_version = (u32_t)-1;
-unordered_map<int, const char *> raw_mode_tostring = {{mode_faketcp, "faketcp"}, {mode_udp, "udp"}, {mode_icmp, "icmp"}};
+unordered_map<int, const char *> raw_mode_tostring = {{mode_faketcp, "faketcp"}, {mode_udp, "udp"}, {mode_icmp, "icmp"}, {mode_tcp, "tcp"}};
 
 int about_to_exit = 0;
 
@@ -138,7 +139,7 @@ void print_help() {
     printf("    run as server : ./this_program -s -l server_listen_ip:server_port -r remote_address:remote_port  [options]\n");
     printf("\n");
     printf("common options,these options must be same on both side:\n");
-    printf("    --raw-mode            <string>        available values:faketcp(default),udp,icmp and easy-faketcp\n");
+    printf("    --raw-mode            <string>        available values:faketcp(default),udp,icmp,easy-faketcp,tcp\n");
     printf("    -k,--key              <string>        password to gen symetric key,default:\"secret key\"\n");
     printf("    --cipher-mode         <string>        available values:aes128cfb,aes128cbc(default),xor,none\n");
     printf("    --auth-mode           <string>        available values:hmac_sha1,md5(default),crc32,simple,none\n");
@@ -151,6 +152,8 @@ void print_help() {
 
     // printf("\n");
     printf("client options:\n");
+    printf("    --http-proxy          <host:port>     HTTP CONNECT proxy, requires --raw-mode tcp on both sides\n");
+    printf("    --http-proxy-auth     <user:password> HTTP proxy Basic authentication\n");
     printf("    --source-ip           <ip>            force source-ip for raw socket\n");
     printf("    --source-port         <port>          force source-port for raw socket,tcp/udp only\n");
     printf("                                          this option disables port changing while re-connecting\n");
@@ -261,6 +264,8 @@ void process_arg(int argc, char *argv[])  // process all options
             {"auth-mode", required_argument, 0, 1},
             {"cipher-mode", required_argument, 0, 1},
             {"raw-mode", required_argument, 0, 1},
+            {"http-proxy", required_argument, 0, 1},
+            {"http-proxy-auth", required_argument, 0, 1},
             {"disable-color", no_argument, 0, 1},
             {"enable-color", no_argument, 0, 1},
             {"log-position", no_argument, 0, 1},
@@ -339,8 +344,14 @@ void process_arg(int argc, char *argv[])  // process all options
 
     mylog(log_info, "argc=%d ", argc);
 
+    vector<const char *> log_args(argc);
     for (i = 0; i < argc; i++) {
-        log_bare(log_info, "%s ", argv[i]);
+        bool secret = i > 0 && (strcmp(argv[i - 1], "-k") == 0 || strcmp(argv[i - 1], "--key") == 0 ||
+                               strcmp(argv[i - 1], "--http-proxy-auth") == 0 || strcmp(argv[i - 1], "--http-proxy") == 0);
+        secret = secret || strncmp(argv[i], "-k", 2) == 0 || strncmp(argv[i], "--key=", 6) == 0 ||
+                 strncmp(argv[i], "--http-proxy=", 13) == 0 || strncmp(argv[i], "--http-proxy-auth=", 18) == 0;
+        log_args[i] = secret ? "<redacted>" : argv[i];
+        log_bare(log_info, "%s ", log_args[i]);
     }
     log_bare(log_info, "\n");
 
@@ -352,7 +363,7 @@ void process_arg(int argc, char *argv[])  // process all options
             a = dummy + a[0] + a[1];
 
         if (all_options.find(a.c_str()) == all_options.end()) {
-            mylog(log_fatal, "invaild option %s\n", a.c_str());
+            mylog(log_fatal, "invaild option %s\n", log_args[i]);
             myexit(-1);
         }
         for (j = i + 1; j < argc; j++) {
@@ -368,7 +379,7 @@ void process_arg(int argc, char *argv[])  // process all options
             if (shortcut_map.find(b) != shortcut_map.end())
                 b = shortcut_map[b];
             if (a == b) {
-                mylog(log_fatal, "%s duplicates with %s\n", argv[i], argv[j]);
+                mylog(log_fatal, "%s duplicates with %s\n", log_args[i], log_args[j]);
                 myexit(-1);
             }
         }
@@ -506,6 +517,10 @@ void process_arg(int argc, char *argv[])  // process all options
                             myexit(-1);
                         }
                     }
+                } else if (strcmp(long_options[option_index].name, "http-proxy") == 0) {
+                    http_proxy_address = optarg;
+                } else if (strcmp(long_options[option_index].name, "http-proxy-auth") == 0) {
+                    http_proxy_credentials = optarg;
                 } else if (strcmp(long_options[option_index].name, "auth-mode") == 0) {
                     for (i = 0; i < auth_end; i++) {
                         if (strcmp(optarg, auth_mode_tostring[i]) == 0) {
@@ -697,6 +712,7 @@ void process_arg(int argc, char *argv[])  // process all options
         print_help();
         myexit(-1);
     }
+    validate_tcp_options();
     if (program_mode == client_mode) {
         raw_ip_version = remote_addr.get_type();
     } else {
@@ -718,7 +734,7 @@ void process_arg(int argc, char *argv[])  // process all options
     log_bare(log_info, "cipher_mode=%s ", cipher_mode_tostring[cipher_mode]);
     log_bare(log_info, "auth_mode=%s ", auth_mode_tostring[auth_mode]);
 
-    log_bare(log_info, "key=%s ", key_string);
+    log_bare(log_info, "key=<redacted> ");
 
     log_bare(log_info, "local_addr=%s ", local_addr.get_str());
     log_bare(log_info, "remote_addr=%s ", remote_addr.get_str());

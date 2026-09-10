@@ -1,0 +1,148 @@
+name: Build HTTP transport binaries
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            make_target: amd64
+            compiler: cc_amd64=g++
+            packages: build-essential
+            strip: strip
+            emulator: ''
+          - arch: x86
+            make_target: x86
+            compiler: cc_x86=g++ -m32
+            packages: g++-multilib qemu-user
+            strip: strip
+            emulator: qemu-i386
+          - arch: armv7
+            make_target: arm
+            compiler: cc_arm=arm-linux-gnueabihf-g++
+            packages: g++-arm-linux-gnueabihf qemu-user
+            strip: arm-linux-gnueabihf-strip
+            emulator: qemu-arm
+          - arch: armv8
+            make_target: armv8
+            compiler: cc_armv8=aarch64-linux-gnu-g++
+            packages: g++-aarch64-linux-gnu qemu-user
+            strip: aarch64-linux-gnu-strip
+            emulator: qemu-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Linux toolchains
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          sudo apt-get update
+          read -r -a packages <<< "$PACKAGES"
+          sudo apt-get install -y --no-install-recommends make "${packages[@]}"
+      - name: Build static binary
+        env:
+          TARGET: ${{ matrix.make_target }}
+          COMPILER: ${{ matrix.compiler }}
+          ARCH: ${{ matrix.arch }}
+          STRIP: ${{ matrix.strip }}
+        run: |
+          mkdir -p dist
+          make "$TARGET" "$COMPILER"
+          "$STRIP" "udp2raw_${TARGET}"
+          cp "udp2raw_${TARGET}" "dist/udp2raw-linux-${ARCH}"
+          file "dist/udp2raw-linux-${ARCH}"
+          readelf -l "dist/udp2raw-linux-${ARCH}" > program-headers.txt
+          readelf -d "dist/udp2raw-linux-${ARCH}" > dynamic.txt
+          if grep -Eq 'INTERP|NEEDED' program-headers.txt dynamic.txt; then
+            echo 'Expected a static binary without shared libraries' >&2
+            exit 1
+          fi
+          tar -C dist -czf "dist/udp2raw-linux-${ARCH}.tar.gz" "udp2raw-linux-${ARCH}"
+      - name: Test TCP transport
+        env:
+          UDP2RAW_TEST_RUNNER: ${{ matrix.emulator }}
+        run: python3 tests/test_tcp_transport.py "dist/udp2raw-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: udp2raw-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            target: i686-w64-mingw32
+            package: g++-mingw-w64-i686-posix
+          - arch: x64
+            target: x86_64-w64-mingw32
+            package: g++-mingw-w64-x86-64-posix
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW toolchain
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends make "$PACKAGE"
+      - name: Build Windows binary
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          make mingw_cross cc_mingw_cross="$TARGET-g++-posix" OPT='-D_WIN32_WINNT=0x0601'
+          "$TARGET-strip" udp2raw_mp.exe
+          cp udp2raw_mp.exe "dist/udp2raw-windows-${ARCH}.exe"
+          file "dist/udp2raw-windows-${ARCH}.exe"
+          "$TARGET-objdump" -p "dist/udp2raw-windows-${ARCH}.exe" > imports.txt
+          if grep -Ei 'DLL Name:.*(libstdc\+\+|libgcc|libwinpthread)' imports.txt; then
+            echo 'Expected statically linked C++ and pthread runtimes' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: udp2raw-windows-${{ matrix.arch }}
+          path: dist/udp2raw-windows-${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  windows-test:
+    name: Test Windows ${{ matrix.arch }}
+    needs: windows
+    runs-on: windows-2025
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: udp2raw-windows-${{ matrix.arch }}
+          path: dist
+      - name: Test TCP transport without a capture driver
+        shell: pwsh
+        run: python tests/test_tcp_transport.py 'dist/udp2raw-windows-${{ matrix.arch }}.exe'

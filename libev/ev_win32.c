@@ -64,7 +64,8 @@ ev_pipe (int filedes [2])
   struct sockaddr_in adr2;
   int adr2_size = sizeof (adr2);
   SOCKET listener;
-  SOCKET sock [2] = { -1, -1 };
+  /* SOCKET 为无符号类型，使用同类型哨兵以兼容 C++11 初始化。 */
+  SOCKET sock [2] = { INVALID_SOCKET, INVALID_SOCKET };
 
   if ((listener = ev_tcp_socket ()) == INVALID_SOCKET)
     return -1;

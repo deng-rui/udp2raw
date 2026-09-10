@@ -73,6 +73,7 @@ enum client_current_state_t { client_idle = 0,
 enum raw_mode_t { mode_faketcp = 0,
                   mode_udp,
                   mode_icmp,
+                  mode_tcp,
                   mode_end };
 enum program_mode_t { unset_mode = 0,
                       client_mode,

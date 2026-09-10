@@ -6,6 +6,7 @@
 #include "lib/md5.h"
 #include "encrypt.h"
 #include "fd_manager.h"
+#include "tcp.h"
 
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents) {
     mylog(log_info, "got sigpipe, ignored");
@@ -44,7 +45,7 @@ int main(int argc, char *argv[]) {
     ev_signal signal_watcher_sigterm;
     ev_signal signal_watcher_sigint;
 
-    if (program_mode == client_mode) {
+    if (program_mode == client_mode || raw_mode == mode_tcp) {
         struct ev_loop *loop = ev_default_loop(0);
 #if !defined(__MINGW32__)
         ev_signal_init(&signal_watcher_sigpipe, sigpipe_cb, SIGPIPE);
@@ -68,9 +69,9 @@ int main(int argc, char *argv[]) {
 #endif
     }
 #if !defined(__MINGW32__)
-    if (geteuid() != 0) {
+    if (raw_mode != mode_tcp && geteuid() != 0) {
         mylog(log_warn, "root check failed, it seems like you are using a non-root account. we can try to continue, but it may fail. If you want to run udp2raw as non-root, you have to add iptables rule manually, and grant udp2raw CAP_NET_RAW capability, check README.md in repo for more info.\n");
-    } else {
+    } else if (raw_mode != mode_tcp) {
         mylog(log_warn, "you can run udp2raw with non-root account for better security. check README.md in repo for more info.\n");
     }
 #endif
@@ -84,6 +85,13 @@ int main(int argc, char *argv[]) {
     mylog(log_info, "const_id:%x\n", const_id);
 
     my_init_keys(key_string, program_mode == client_mode ? 1 : 0);
+
+    if (raw_mode == mode_tcp)
+        return tcp_event_loop();
+
+#if defined(__MINGW32__) || defined(__CYGWIN__)
+    init_pcap();
+#endif
 
     iptables_rule();
 

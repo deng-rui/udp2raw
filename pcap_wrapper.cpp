@@ -32,13 +32,6 @@ char *(*pcap_lookupdev)(char *) = 0;
 
 int (*pcap_findalldevs)(pcap_if_t **, char *) = 0;
 
-struct init_pcap_t {
-    init_pcap_t() {
-        init_pcap();
-    }
-
-} do_it;
-
 static void init_npcap_dll_path() {
     BOOL(WINAPI * SetDllDirectory)
     (LPCTSTR);
