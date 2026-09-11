@@ -181,6 +181,11 @@ client. With AES enabled, the proxy sees the destination and encrypted stream,
 but cannot read the UDP payload. Basic proxy credentials are sent to the proxy
 without TLS; use a trusted proxy connection.
 
+The client sends the first encrypted handshake record together with the
+CONNECT request. This avoids a deadlock with proxies that wait for client data
+before relaying the upstream connection. Both endpoints must use this protocol
+version.
+
 ```bash
 # server
 ./udp2raw -s -l 0.0.0.0:4096 -r 127.0.0.1:7777 --raw-mode tcp -k passwd --auth-mode hmac_sha1

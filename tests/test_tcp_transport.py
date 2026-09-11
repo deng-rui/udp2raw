@@ -170,6 +170,20 @@ class Proxy:
             upstream = socket.create_connection(self.target, timeout=3)
             with self.lock:
                 self.active.append(upstream)
+            pending = b""
+            client.setblocking(False)
+            try:
+                while True:
+                    chunk = client.recv(8192)
+                    if not chunk:
+                        return
+                    pending += chunk
+            except BlockingIOError:
+                pass
+            finally:
+                client.settimeout(3)
+            if pending:
+                upstream.sendall(pending)
             response = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: loopback-test\r\n\r\n"
             if self.coalesce:
                 initial = receive_record(upstream)
@@ -370,16 +384,20 @@ class TransportTests(unittest.TestCase):
         target, echo, _ = self.server()
         local, client = self.client(target, key="wrong-tunnel-key", ready=False)
         self.udp_socket().sendto(b"not authenticated", local)
-        client.wait_log("invalid or unauthenticated TCP record")
+        client.wait_log("tcp tunnel closed")
         self.assertNotIn("tcp tunnel ready", client.log())
         self.assertEqual([], echo.received)
 
     def open_plain(self, target):
         sock = socket.create_connection(target, timeout=2)
         self.addCleanup(sock.close)
+        client_nonce = os.urandom(16)
+        client_id = os.urandom(16)
+        sock.sendall(plain_record(b"H", client_nonce, b"\x00" * 16, 1, data=client_id))
         challenge = receive_record(sock)
         self.assertEqual(b"U2T2C", challenge[16:21])
-        return sock, os.urandom(16), challenge[21:37]
+        self.assertEqual(client_nonce, challenge[37:53])
+        return sock, client_nonce, challenge[21:37], client_id
 
     def assert_closed(self, sock, timeout=3):
         sock.settimeout(timeout)
@@ -392,17 +410,16 @@ class TransportTests(unittest.TestCase):
 
     def test_replayed_handshake_and_record_are_rejected(self):
         target, echo, _ = self.server(cipher="none", auth="none")
-        sock, client_nonce, server_nonce = self.open_plain(target)
-        client_id = os.urandom(16)
-        hello = plain_record(b"H", client_nonce, server_nonce, 1, data=client_id)
-        sock.sendall(hello)
-        self.assertEqual(b"A", receive_record(sock)[20:21])
-        data = plain_record(b"D", client_nonce, server_nonce, 2, 7, struct.pack("!HH", 4, 0) + b"once")
+        sock, client_nonce, server_nonce, client_id = self.open_plain(target)
+        hello = plain_record(b"H", client_nonce, b"\x00" * 16, 1, data=client_id)
+        sock.sendall(plain_record(b"A", client_nonce, server_nonce, 2))
+        data = plain_record(b"D", client_nonce, server_nonce, 3, 7, struct.pack("!HH", 4, 0) + b"once")
         sock.sendall(data)
         self.assertEqual(b"once", receive_record(sock)[69:])
         sock.sendall(data)
         self.assert_closed(sock)
-        second, _, _ = self.open_plain(target)
+        second = socket.create_connection(target, timeout=2)
+        self.addCleanup(second.close)
         second.sendall(hello)
         self.assert_closed(second)
         self.assertEqual([b"once"], [data for data, _ in echo.received])
@@ -411,10 +428,10 @@ class TransportTests(unittest.TestCase):
         target, _, _ = self.server(cipher="none", auth="none")
         for size in (0, 64, 1801, 65535):
             with self.subTest(size=size):
-                sock, _, _ = self.open_plain(target)
+                sock, _, _, _ = self.open_plain(target)
                 sock.sendall(struct.pack("!H", size))
                 self.assert_closed(sock)
-        partial, _, _ = self.open_plain(target)
+        partial, _, _, _ = self.open_plain(target)
         partial.sendall(b"\x00")
         self.assert_closed(partial, timeout=7)
 

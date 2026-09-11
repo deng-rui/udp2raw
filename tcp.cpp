@@ -186,6 +186,7 @@ struct tcp_connection {
     char remote_nonce[nonce_size] = {};
     char peer_id[nonce_size] = {};
     bool has_peer_id = false;
+    bool client_handshake_sent = false;
     u64_t send_sequence = 1, recv_sequence = 1;
     u64_t started = get_current_time(), last_received = started, last_sent = started;
     string input, output;
@@ -202,6 +203,7 @@ struct tcp_connection {
     size_t queued() const { return output.size() - written; }
     void fail(const char *reason);
     void connected();
+    bool start_client_handshake();
     void append_output(const string &bytes);
     bool encode(string &bytes, char type, u32_t conv, const char *data, int len);
     bool control(char type, const char *data = NULL, int len = 0);
@@ -229,6 +231,7 @@ struct tcp_context {
     vector<address_t> destinations;
     size_t destination_index = 0;
     size_t client_round_robin = 0;
+    unordered_map<string, u64_t> handshake_nonces;
     size_t udp_count = 0, queued_bytes = 0;
     u64_t next_connect = 0, queue_drops = 0;
 
@@ -407,7 +410,21 @@ void tcp_connection::connected() {
         string request = "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\n";
         if (!http_proxy_credentials.empty()) request += "Proxy-Authorization: Basic " + base64(http_proxy_credentials) + "\r\n";
         append_output(request + "\r\n");
+        start_client_handshake();
+    } else {
+        start_client_handshake();
     }
+}
+
+bool tcp_connection::start_client_handshake() {
+    if (program_mode != client_mode || (phase != tcp_phase::proxy && phase != tcp_phase::challenge)) return false;
+    if (client_handshake_sent) return true;
+    client_handshake_sent = true;
+    if (!control('H', context.client_id, nonce_size)) {
+        client_handshake_sent = false;
+        return false;
+    }
+    return true;
 }
 
 void tcp_connection::write_cb(struct ev_loop *, ev_io *watcher, int) {
@@ -527,24 +544,33 @@ bool tcp_connection::process_record(char *plain, int len) {
     u32_t conv = read_u32(plain + 61);
     int data_len = len - record_header_size;
     ++recv_sequence;
-    if (phase == tcp_phase::challenge) {
-        if (type != 'C' || conv != 0 || data_len != 0 || !zero_nonce(plain + 37)) return false;
-        memcpy(remote_nonce, plain + 21, nonce_size);
-        phase = tcp_phase::accept;
-        return control('H', context.client_id, nonce_size);
-    }
-    if (memcmp(plain + 37, local_nonce, nonce_size) != 0) return false;
-    if (phase == tcp_phase::hello) {
-        if (type != 'H' || conv != 0 || data_len != nonce_size) return false;
+
+    if (program_mode == server_mode && phase == tcp_phase::hello) {
+        if (type != 'H' || conv != 0 || data_len != nonce_size || !zero_nonce(plain + 37)) return false;
+        string nonce(plain + 21, nonce_size);
+        if (context.handshake_nonces.find(nonce) != context.handshake_nonces.end()) return false;
+        context.handshake_nonces[nonce] = get_current_time();
         memcpy(remote_nonce, plain + 21, nonce_size);
         memcpy(peer_id, plain + record_header_size, nonce_size);
         has_peer_id = true;
-        phase = tcp_phase::ready;
-        return control('A');
+        phase = tcp_phase::accept;
+        return control('C');
     }
-    if (memcmp(plain + 21, remote_nonce, nonce_size) != 0) return false;
+
+    if (program_mode == client_mode && phase == tcp_phase::challenge) {
+        if (type != 'C' || conv != 0 || data_len != 0 || memcmp(plain + 37, local_nonce, nonce_size) != 0) return false;
+        memcpy(remote_nonce, plain + 21, nonce_size);
+        phase = tcp_phase::accept;
+        if (!control('A')) return false;
+        phase = tcp_phase::ready;
+        mylog(log_info, "tcp tunnel ready%s\n", http_proxy_address.empty() ? "" : " through HTTP CONNECT proxy");
+        return true;
+    }
+
     if (phase == tcp_phase::accept) {
-        if (type != 'A' || conv != 0 || data_len != 0) return false;
+        if (program_mode != server_mode || type != 'A' || conv != 0 || data_len != 0 ||
+            memcmp(plain + 21, remote_nonce, nonce_size) != 0 || memcmp(plain + 37, local_nonce, nonce_size) != 0)
+            return false;
         phase = tcp_phase::ready;
         mylog(log_info, "tcp tunnel ready%s\n", http_proxy_address.empty() ? "" : " through HTTP CONNECT proxy");
         return true;
@@ -708,7 +734,6 @@ void tcp_context::local_cb(struct ev_loop *, ev_io *watcher, int) {
             context.connections.emplace_back(new tcp_connection(context, fd, tcp_phase::hello));
             tcp_connection &connection = *context.connections.back();
             ev_io_start(context.loop, &connection.reader);
-            connection.control('C');
             continue;
         }
         char data[65536];
@@ -753,6 +778,12 @@ void tcp_context::timer_cb(struct ev_loop *, ev_timer *watcher, int) {
         } else ++it;
     }
     if (program_mode == server_mode) {
+        for (auto it = context.handshake_nonces.begin(); it != context.handshake_nonces.end();) {
+            if (now - it->second >= server_conn_timeout)
+                it = context.handshake_nonces.erase(it);
+            else
+                ++it;
+        }
         for (auto it = context.server_peers.begin(); it != context.server_peers.end();) {
             if (now - it->second->last_active >= conv_timeout)
                 it = context.server_peers.erase(it);
