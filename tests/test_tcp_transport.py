@@ -117,7 +117,7 @@ class Echo:
 
 
 class Proxy:
-    def __init__(self, target, credentials=None, response=None, split=False, coalesce=False, host="127.0.0.1"):
+    def __init__(self, target, credentials=None, response=None, split=False, coalesce=False, host="127.0.0.1", inspect_plain=False):
         self.target, self.credentials = target, credentials
         self.response, self.split, self.coalesce = response, split, coalesce
         self.sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
@@ -129,6 +129,10 @@ class Proxy:
         self.lock = threading.Lock()
         self.active, self.threads, self.requests, self.errors = [], [], [], []
         self.forwarded_clients = set()
+        self.inspect_plain = inspect_plain
+        self.records = []
+        self.paused = set()
+        self.lanes = {}
         self.thread = threading.Thread(target=self.accept, daemon=True)
         self.thread.start()
 
@@ -148,6 +152,24 @@ class Proxy:
 
     def handle(self, client):
         upstream = None
+        lane = id(client)
+        buffers = {"up": bytearray(), "down": bytearray()}
+
+        def observe(direction, data):
+            if not self.inspect_plain:
+                return
+            buffer = buffers[direction]
+            buffer.extend(data)
+            while len(buffer) >= 2:
+                size = struct.unpack("!H", buffer[:2])[0]
+                if len(buffer) < size + 2:
+                    break
+                record = bytes(buffer[2:size + 2])
+                del buffer[:size + 2]
+                if len(record) >= 65 and record[16:20] == b"U2T2":
+                    with self.lock:
+                        self.records.append((lane, direction, record[20:21]))
+
         try:
             client.settimeout(3)
             header = bytearray()
@@ -170,6 +192,7 @@ class Proxy:
             upstream = socket.create_connection(self.target, timeout=3)
             with self.lock:
                 self.active.append(upstream)
+                self.lanes[lane] = (client, upstream)
             pending = b""
             client.setblocking(False)
             try:
@@ -183,10 +206,12 @@ class Proxy:
             finally:
                 client.settimeout(3)
             if pending:
+                observe("up", pending)
                 upstream.sendall(pending)
             response = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: loopback-test\r\n\r\n"
             if self.coalesce:
                 initial = receive_record(upstream)
+                observe("down", struct.pack("!H", len(initial)) + initial)
                 response += struct.pack("!H", len(initial)) + initial
             if self.split:
                 for byte in response[:12]:
@@ -196,12 +221,23 @@ class Proxy:
             else:
                 client.sendall(response)
             while not self.stopped.is_set():
-                readable, _, _ = select.select([client, upstream], [], [], 0.1)
+                with self.lock:
+                    readers = [sock for sock, direction in ((client, "up"), (upstream, "down"))
+                               if (lane, direction) not in self.paused]
+                if not readers:
+                    self.stopped.wait(0.01)
+                    continue
+                readable, _, _ = select.select(readers, [], [], 0.05)
                 for source in readable:
+                    direction = "up" if source is client else "down"
+                    with self.lock:
+                        if (lane, direction) in self.paused:
+                            continue
                     data = source.recv(8192)
                     if not data:
                         return
                     destination = upstream if source is client else client
+                    observe(direction, data)
                     if source is client:
                         with self.lock:
                             self.forwarded_clients.add(id(client))
@@ -214,12 +250,34 @@ class Proxy:
         except (OSError, EOFError, ValueError):
             pass
         finally:
+            with self.lock:
+                self.lanes.pop(lane, None)
             for sock in (client, upstream):
                 if sock is not None:
                     with self.lock:
                         if sock in self.active:
                             self.active.remove(sock)
                     sock.close()
+
+    def data_lanes(self, direction):
+        with self.lock:
+            return {lane for lane, side, kind in self.records if side == direction and kind == b"D"}
+
+    def pause(self, lane, direction):
+        with self.lock:
+            self.paused.add((lane, direction))
+
+    def resume(self):
+        with self.lock:
+            self.paused.clear()
+
+    def disconnect_lane(self, lane):
+        with self.lock:
+            for sock in self.lanes.get(lane, ()):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def disconnect(self):
         with self.lock:
@@ -350,6 +408,111 @@ class TransportTests(unittest.TestCase):
         self.assertEqual({f"mux-peer-{index}".encode() for index in range(6)},
                          {payload for payload, _ in echo.received if payload.startswith(b"mux-peer-")})
         self.assertIn("tcp_connections=3", client.log())
+
+    def test_single_udp_flow_uses_all_lanes_in_both_directions(self):
+        target, echo, _ = self.server(cipher="none", auth="none")
+        proxy = self.proxy(target, inspect_plain=True, split=True, coalesce=True)
+        local, client = self.client(target, proxy, cipher="none", auth="none", tcp_connections=3)
+        sock = self.udp_socket()
+        for index in range(12):
+            self.exchange(sock, local, struct.pack("!I", index) + os.urandom(1200))
+        self.assertEqual(3, len(proxy.data_lanes("up")))
+        self.assertEqual(3, len(proxy.data_lanes("down")))
+        self.assertEqual(1, len({source for _, source in echo.received}))
+        self.assertNotIn("tcp tunnel closed", client.log())
+
+    def test_single_flow_continues_when_a_lane_stalls(self):
+        for direction in ("up", "down"):
+            with self.subTest(direction=direction):
+                target, echo, server = self.server(cipher="none", auth="none")
+                proxy = self.proxy(target, inspect_plain=True)
+                local, client = self.client(target, proxy, cipher="none", auth="none", tcp_connections=3)
+                sock = self.udp_socket()
+                self.exchange(sock, local, b"warmup")
+                lane = next(iter(proxy.data_lanes(direction)))
+                proxy.pause(lane, direction)
+                payloads = {struct.pack("!I", index) + os.urandom(1200) for index in range(60)}
+                for data in payloads:
+                    sock.sendto(data, local)
+                received = set()
+                deadline = time.monotonic() + 2
+                sock.settimeout(0.1)
+                while time.monotonic() < deadline:
+                    try:
+                        data = sock.recvfrom(65536)[0]
+                    except socket.timeout:
+                        continue
+                    self.assertIn(data, payloads)
+                    self.assertNotIn(data, received)
+                    received.add(data)
+                self.assertGreater(len(received), 0, "a stalled TCP lane blocked the whole UDP flow")
+                self.assertLess(len(received), len(payloads), "the test did not stall any datagrams")
+                proxy.resume()
+                sock.settimeout(4)
+                while len(received) < len(payloads):
+                    data = sock.recvfrom(65536)[0]
+                    self.assertIn(data, payloads)
+                    self.assertNotIn(data, received)
+                    received.add(data)
+                self.assertEqual(1, len({source for _, source in echo.received}))
+                self.assertNotIn("tcp tunnel closed", client.log())
+                client.close()
+                server.close()
+                proxy.close()
+
+    def test_mux_lane_loss_keeps_remote_udp_socket(self):
+        target, echo, server = self.server(cipher="none", auth="none")
+        proxy = self.proxy(target, inspect_plain=True)
+        local, client = self.client(target, proxy, cipher="none", auth="none", tcp_connections=3)
+        sock = self.udp_socket()
+        self.exchange(sock, local, b"before lane loss")
+        source = echo.received[-1][1]
+        proxy.disconnect_lane(next(iter(proxy.data_lanes("up"))))
+        client.wait_log("tcp tunnel closed")
+        server.wait_log("tcp tunnel closed")
+        for index in range(6):
+            self.exchange(sock, local, f"surviving-lane-{index}".encode())
+        client.wait_log("tcp tunnel ready", occurrences=4)
+        proxy.disconnect()
+        client.wait_log("tcp tunnel ready", occurrences=7)
+        # A reply can arrive before a new client datagram after all lanes reconnect.
+        echo.sock.sendto(b"server push after reconnect", source)
+        self.assertEqual(b"server push after reconnect", sock.recvfrom(65536)[0])
+        self.exchange(sock, local, b"after all lanes reconnect")
+        self.assertEqual({source}, {address for _, address in echo.received})
+
+    def test_idle_mux_lanes_send_heartbeats(self):
+        target, _, _ = self.server(cipher="none", auth="none")
+        proxy = self.proxy(target, inspect_plain=True)
+        local, client = self.client(target, proxy, cipher="none", auth="none", tcp_connections=3)
+        with proxy.lock:
+            proxy.records.clear()
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            with proxy.lock:
+                observed = {(lane, side) for lane, side, kind in proxy.records if kind == b"P"}
+            if len(observed) == 6:
+                break
+            time.sleep(0.02)
+        self.assertEqual(6, len(observed), "each idle lane must send heartbeats in both directions")
+        self.exchange(self.udp_socket(), local, b"after idle")
+        self.assertNotIn("tcp tunnel closed", client.log())
+
+    @unittest.skipUnless(os.name == "nt", "Windows UDP ICMP error behavior")
+    def test_closed_local_udp_port_does_not_reset_listener(self):
+        target, echo, _ = self.server()
+        local, client = self.client(target)
+        closed_peer, live_peer = self.udp_socket(), self.udp_socket()
+        self.exchange(closed_peer, local, b"closing peer")
+        remote_source = echo.received[-1][1]
+        closed_peer.close()
+        for index in range(12):
+            echo.sock.sendto(b"late reply", remote_source)
+            self.exchange(live_peer, local, f"still-live-{index}".encode())
+        time.sleep(0.1)
+        self.assertNotIn("10054", client.log())
+        self.assertNotIn("tcp local UDP receive failed", client.log())
+        self.assertNotIn("tcp tunnel closed", client.log())
 
     def test_ipv6_proxy_and_endpoints(self):
         try:

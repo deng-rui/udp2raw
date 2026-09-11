@@ -7,7 +7,9 @@
 
 #include <climits>
 #include <memory>
-#if !defined(__MINGW32__)
+#if defined(__MINGW32__)
+#include <mswsock.h>
+#else
 #include <netdb.h>
 #include <netinet/tcp.h>
 #endif
@@ -77,6 +79,20 @@ int socket_fd(my_fd_t fd) {
 int new_socket(address_t address, int type) {
     int fd = socket_fd(socket(address.get_type(), type, type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP));
     if (fd < 0) return -1;
+#if defined(__MINGW32__)
+    if (type == SOCK_DGRAM) {
+        // Windows 默认把 UDP 对端的 ICMP Port Unreachable 转成 WSAECONNRESET，
+        // 这会污染隧道本地 UDP 接收循环；UDP 隧道应把它视为瞬时网络事件。
+        BOOL reset_behavior = FALSE;
+        DWORD bytes_returned = 0;
+        if (WSAIoctl((SOCKET)fd, SIO_UDP_CONNRESET, &reset_behavior, sizeof(reset_behavior),
+                     NULL, 0, &bytes_returned, NULL, NULL) == SOCKET_ERROR) {
+            mylog(log_error, "cannot disable Windows UDP connection resets: %s\n", get_sock_error());
+            sock_close(fd);
+            return -1;
+        }
+    }
+#endif
     setnonblocking(fd);
     set_buf_size(fd, socket_buf_size);
     return fd;
@@ -152,12 +168,12 @@ struct tcp_connection;
 
 struct udp_peer {
     tcp_context &context;
-    tcp_connection *connection;
+    char client_id[nonce_size];
     u32_t conv;
     int fd;
     ev_io reader;
     u64_t last_active;
-    udp_peer(tcp_context &context, tcp_connection *connection, u32_t conv, int fd);
+    udp_peer(tcp_context &context, const char *client_id, u32_t conv, int fd);
     ~udp_peer();
     static void read_cb(struct ev_loop *, ev_io *watcher, int);
 };
@@ -224,13 +240,13 @@ struct tcp_context {
     ev_timer timer;
     list<unique_ptr<tcp_connection>> connections;
     unordered_map<string, unique_ptr<udp_peer>> server_peers;
-    unordered_map<u32_t, tcp_connection *> client_routes;
     tcp_connection *client = NULL;
     conv_manager_t<address_t> client_peers;
     char client_id[nonce_size] = {};
     vector<address_t> destinations;
     size_t destination_index = 0;
     size_t client_round_robin = 0;
+    size_t server_round_robin = 0;
     unordered_map<string, u64_t> handshake_nonces;
     size_t udp_count = 0, queued_bytes = 0;
     u64_t next_connect = 0, queue_drops = 0;
@@ -239,7 +255,9 @@ struct tcp_context {
         if (program_mode == client_mode) random_nonce(client_id);
     }
     void connect_client();
-    tcp_connection *select_client_connection(u32_t conv);
+    tcp_connection *select_connection(const char *peer_id, size_t &round_robin);
+    tcp_connection *select_client_connection();
+    tcp_connection *select_server_connection(const char *peer_id);
     int client_connection_count() const;
     void queue_drop() {
         ++queue_drops;
@@ -250,11 +268,13 @@ struct tcp_context {
     static void timer_cb(struct ev_loop *, ev_timer *watcher, int);
 };
 
-udp_peer::udp_peer(tcp_context &context, tcp_connection *connection, u32_t conv, int fd)
-    : context(context), connection(connection), conv(conv), fd(fd), last_active(get_current_time()) {
+udp_peer::udp_peer(tcp_context &context, const char *client_id, u32_t conv, int fd)
+    : context(context), conv(conv), fd(fd), last_active(get_current_time()) {
+    // UDP 会话只绑定客户端身份，回包按报文重新选择 TCP lane，避免单 lane 阻塞整个流。
+    memcpy(this->client_id, client_id, nonce_size);
     ev_io_init(&reader, read_cb, fd, EV_READ);
     reader.data = this;
-    if (connection) ev_io_start(context.loop, &reader);
+    ev_io_start(context.loop, &reader);
     ++context.udp_count;
 }
 
@@ -266,12 +286,7 @@ udp_peer::~udp_peer() {
 
 void udp_peer::read_cb(struct ev_loop *, ev_io *watcher, int) {
     udp_peer &peer = *(udp_peer *)watcher->data;
-    if (!peer.connection || !peer.connection->ready()) {
-        char discarded[65536];
-        recv(peer.fd, discarded, sizeof(discarded), 0);
-        return;
-    }
-    for (int i = 0; i < io_batch_limit && peer.connection && peer.connection->ready(); ++i) {
+    for (int i = 0; i < io_batch_limit; ++i) {
         char data[65536];
         int len = recv(peer.fd, data, sizeof(data), 0);
         if (len < 0) {
@@ -281,7 +296,8 @@ void udp_peer::read_cb(struct ev_loop *, ev_io *watcher, int) {
             return;
         }
         peer.last_active = get_current_time();
-        peer.connection->send_datagram(peer.conv, data, len);
+        tcp_connection *connection = peer.context.select_server_connection(peer.client_id);
+        if (connection) connection->send_datagram(peer.conv, data, len);
     }
 }
 
@@ -307,25 +323,16 @@ void tcp_connection::fail(const char *reason) {
     phase = tcp_phase::dead;
     ev_io_stop(context.loop, &reader);
     ev_io_stop(context.loop, &writer);
-    for (auto &peer : context.server_peers) {
-        if (peer.second->connection == this) {
-            peer.second->connection = NULL;
-            ev_io_stop(context.loop, &peer.second->reader);
-        }
-    }
-    for (auto it = context.client_routes.begin(); it != context.client_routes.end();) {
-        if (it->second == this)
-            it = context.client_routes.erase(it);
-        else
-            ++it;
-    }
     if (context.client == this) context.client = NULL;
     sock_close(fd);
     fd = -1;
 }
 
 void tcp_connection::append_output(const string &bytes) {
-    if (written) {
+    if (written == output.size()) {
+        output.clear();
+        written = 0;
+    } else if (written && (written >= 65536 || written * 2 >= output.size())) {
         output.erase(0, written);
         written = 0;
     }
@@ -385,6 +392,7 @@ void tcp_connection::send_datagram(u32_t conv, const char *data, int len) {
         return;
     }
     string bytes;
+    bytes.reserve(bound);
     int offset = 0;
     do {
         int count = min(chunk_limit, len - offset);
@@ -630,17 +638,10 @@ void tcp_connection::deliver(u32_t conv, const char *data, int len) {
             sock_close(udp_fd);
             return;
         }
-        context.server_peers.emplace(key, unique_ptr<udp_peer>(new udp_peer(context, this, conv, udp_fd)));
+        context.server_peers.emplace(key, unique_ptr<udp_peer>(new udp_peer(context, peer_id, conv, udp_fd)));
         found = context.server_peers.find(key);
     } else {
-        if (found->second->connection && found->second->connection != this) {
-            mylog(log_warn, "tcp UDP conversation is already attached to another connection\n");
-            return;
-        }
-        bool reattached = found->second->connection == NULL;
-        found->second->connection = this;
         found->second->last_active = get_current_time();
-        if (reattached) ev_io_start(context.loop, &found->second->reader);
     }
     if (send(found->second->fd, data, len, 0) != len)
         mylog(log_warn, "tcp remote UDP send failed: %s\n", get_sock_error());
@@ -670,29 +671,37 @@ int tcp_context::client_connection_count() const {
     return count;
 }
 
-tcp_connection *tcp_context::select_client_connection(u32_t conv) {
-    auto route = client_routes.find(conv);
-    if (route != client_routes.end()) {
-        if (route->second && route->second->ready()) return route->second;
-        client_routes.erase(route);
-    }
-
-    vector<tcp_connection *> candidates;
+tcp_connection *tcp_context::select_connection(const char *peer_id, size_t &round_robin) {
+    // 一个完整 UDP 报文及其分片固定在同一 lane，不同报文可跨 lane 乱序传输。
     size_t minimum_queue = connection_queue_limit + 1;
+    size_t candidates = 0;
     for (const auto &connection : connections) {
         if (!connection->ready()) continue;
+        if (peer_id && (!connection->has_peer_id || memcmp(connection->peer_id, peer_id, nonce_size) != 0)) continue;
         size_t queued = connection->queued();
         if (queued < minimum_queue) {
             minimum_queue = queued;
-            candidates.clear();
-            candidates.push_back(connection.get());
+            candidates = 1;
         } else if (queued == minimum_queue) {
-            candidates.push_back(connection.get());
+            ++candidates;
         }
     }
-    tcp_connection *selected = candidates.empty() ? NULL : candidates[client_round_robin++ % candidates.size()];
-    if (selected) client_routes[conv] = selected;
-    return selected;
+    if (!candidates) return NULL;
+    size_t selected = round_robin++ % candidates;
+    for (const auto &connection : connections) {
+        if (!connection->ready() || connection->queued() != minimum_queue) continue;
+        if (peer_id && (!connection->has_peer_id || memcmp(connection->peer_id, peer_id, nonce_size) != 0)) continue;
+        if (selected-- == 0) return connection.get();
+    }
+    return NULL;
+}
+
+tcp_connection *tcp_context::select_client_connection() {
+    return select_connection(NULL, client_round_robin);
+}
+
+tcp_connection *tcp_context::select_server_connection(const char *peer_id) {
+    return select_connection(peer_id, server_round_robin);
 }
 
 void tcp_context::connect_client() {
@@ -758,7 +767,7 @@ void tcp_context::local_cb(struct ev_loop *, ev_io *watcher, int) {
             conv = context.client_peers.get_new_conv();
             context.client_peers.insert_conv(conv, source);
         }
-        tcp_connection *connection = context.select_client_connection(conv);
+        tcp_connection *connection = context.select_client_connection();
         if (!connection) continue;
         connection->send_datagram(conv, data, count);
     }
@@ -793,12 +802,6 @@ void tcp_context::timer_cb(struct ev_loop *, ev_timer *watcher, int) {
     }
     if (program_mode == client_mode) {
         context.client_peers.clear_inactive0(NULL);
-        for (auto it = context.client_routes.begin(); it != context.client_routes.end();) {
-            if (!context.client_peers.is_conv_used(it->first))
-                it = context.client_routes.erase(it);
-            else
-                ++it;
-        }
         if (context.client_connection_count() < tcp_connections && now >= context.next_connect)
             context.connect_client();
         if (!context.client || !context.client->ready()) {

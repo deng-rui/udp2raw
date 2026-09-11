@@ -207,15 +207,18 @@ auth modes. Do not use `-a`, `-g` or `--easy-tcp` with TCP mode.
 
 TCP mode preserves UDP datagram boundaries up to 65507 bytes and reconnects
 automatically. Use `--tcp-connections N` on the client to create N parallel
-encrypted TCP/HTTP CONNECT streams; each UDP conversation stays on one stream,
-so a stalled TCP stream affects only its assigned conversations. The client keeps its conversation IDs, and the server keeps each
-conversation's connected UDP socket for `conv_timeout`, so a reconnect from the
-same running client preserves the remote UDP source port and common application
-state. Packets already in a broken TCP connection or sent while disconnected are
-still lost; a client process restart creates a new identity. Unlike FakeTCP, real
-TCP retransmits and delivers in order, which can increase latency on lossy links.
-MUX does not remove TCP's head-of-line blocking inside one stream; increase
-`--tcp-connections` when independent UDP flows need loss isolation.
+encrypted TCP/HTTP CONNECT streams. Each complete UDP datagram stays on one
+stream, while different datagrams from the same UDP conversation may use
+different streams and arrive out of order. This lets a Hy2/QUIC UDP flow use
+the whole MUX pool; a stalled stream delays only the datagrams queued on that
+stream. The server keeps one connected UDP socket for each `(client, conversation)`
+for `conv_timeout`, so moving datagrams between streams and reconnecting from
+the same running client preserves the remote UDP source port and common
+application state. Packets already in a broken TCP connection or sent while
+disconnected are still lost; a client process restart creates a new identity.
+Unlike FakeTCP, each TCP stream retransmits and delivers in order, which can
+increase latency on lossy links. MUX removes cross-stream head-of-line blocking,
+but TCP head-of-line blocking remains inside each stream.
 
 The workflow runs `tests/test_tcp_transport.py` against each Linux binary (with
 QEMU for Linux ARM targets) and on both Windows runners, covering proxy

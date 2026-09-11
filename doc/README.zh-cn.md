@@ -132,6 +132,7 @@ common options,these options must be same on both side:
 client options:
     --http-proxy          <host:port>     HTTP CONNECT proxy，仅 TCP 模式客户端可用
     --http-proxy-auth     <user:password> HTTP 代理 Basic 认证
+    --tcp-connections     <number>        TCP MUX 并发连接数，1..16，默认 1
     --source-ip           <ip>            force source-ip for raw socket
     --source-port         <port>          force source-port for raw socket,tcp/udp only
                                           this option disables port changing while re-connecting
@@ -171,6 +172,16 @@ other options:
     --retry-on-error                      retry on error, allow to start udp2raw before network is initialized
     -h,--help                             print this help message
 ```
+
+### TCP / HTTP CONNECT 模式
+
+`--raw-mode tcp` 会把加密后的 UDP 报文封装进真实 TCP 流，因此可以通过只允许
+TCP 的普通 HTTP `CONNECT` 代理。客户端使用 `--tcp-connections N` 建立 N 条
+独立 TCP 流；每个完整 UDP 报文固定在一条流内，但同一个 UDP 会话的不同报文
+可以分散到不同流并乱序到达，适合承载 Hy2/QUIC。单条 TCP 流仍有队头阻塞，
+某条流拥塞时只影响分配到它的报文。服务端会在同一客户端和 conversation 下
+保持 UDP socket，因此换流或重连不会改变远端 UDP 源端口。`faketcp` 模式仍使用
+原有 raw socket 路径。
 
 ### iptables 规则,`-a`和`-g`
 用raw收发tcp包本质上绕过了linux内核的tcp协议栈。linux碰到raw socket发来的包会不认识，如果一直收到不认识的包，会回复大量RST，造成不稳定或性能问题。所以强烈建议添加iptables规则屏蔽Linux内核的对指定端口的处理。用-a选项，udp2raw会在启动的时候自动帮你加上Iptables规则，退出的时候再自动删掉。如果长期使用，可以用-g选项来生成相应的Iptables规则再自己手动添加，这样规则不会在udp2raw退出时被删掉，可以避免停掉udp2raw后内核向对端回复RST。
