@@ -5,6 +5,7 @@
 
 extern std::string http_proxy_address;
 extern std::string http_proxy_credentials;
+extern int tcp_connections;
 
 void validate_tcp_options();
 int tcp_event_loop();

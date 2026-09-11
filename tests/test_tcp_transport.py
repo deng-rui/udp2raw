@@ -128,6 +128,7 @@ class Proxy:
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.active, self.threads, self.requests, self.errors = [], [], [], []
+        self.forwarded_clients = set()
         self.thread = threading.Thread(target=self.accept, daemon=True)
         self.thread.start()
 
@@ -187,6 +188,9 @@ class Proxy:
                     if not data:
                         return
                     destination = upstream if source is client else client
+                    if source is client:
+                        with self.lock:
+                            self.forwarded_clients.add(id(client))
                     if self.split:
                         destination.sendall(data[:1])
                         destination.sendall(data[1:3])
@@ -241,7 +245,7 @@ class TransportTests(unittest.TestCase):
         process.wait_log("tcp mode TCP listening")
         return target, echo, process
 
-    def client(self, target, proxy=None, credentials=None, host="127.0.0.1", key=KEY, cipher="aes128cbc", auth="hmac_sha1", ready=True):
+    def client(self, target, proxy=None, credentials=None, host="127.0.0.1", key=KEY, cipher="aes128cbc", auth="hmac_sha1", ready=True, tcp_connections=1):
         local = (host, unused_port(host, socket.SOCK_DGRAM))
         args = ["-c", "-l", authority(local), "-r", authority(target), "--raw-mode", "tcp", "-k", key,
                 "--cipher-mode", cipher, "--auth-mode", auth]
@@ -249,11 +253,13 @@ class TransportTests(unittest.TestCase):
             args += ["--http-proxy", "http://" + authority(proxy.address)]
         if credentials:
             args += ["--http-proxy-auth", credentials]
+        if tcp_connections != 1:
+            args += ["--tcp-connections", str(tcp_connections)]
         process = self.start(args)
         process.wait_log("tcp mode UDP listening")
         if ready:
             try:
-                process.wait_log("tcp tunnel ready")
+                process.wait_log("tcp tunnel ready", occurrences=tcp_connections)
             except AssertionError as error:
                 logs = "\n\n".join(item.log() for item in self.processes)
                 raise AssertionError(f"{error}\nall process logs:\n{logs}")
@@ -317,6 +323,19 @@ class TransportTests(unittest.TestCase):
                 two, _ = self.client(target, cipher=cipher, auth=auth)
                 self.exchange(self.udp_socket(), one, os.urandom(1800))
                 self.exchange(self.udp_socket(), two, os.urandom(32000))
+
+    def test_parallel_tcp_mux_connections(self):
+        target, echo, _ = self.server()
+        proxy = self.proxy(target, split=True, coalesce=True)
+        local, client = self.client(target, proxy, tcp_connections=3)
+        sockets = [self.udp_socket() for _ in range(6)]
+        for index, sock in enumerate(sockets):
+            self.exchange(sock, local, f"mux-peer-{index}".encode())
+        self.assertGreaterEqual(len(proxy.requests), 3)
+        self.assertGreaterEqual(len(proxy.forwarded_clients), 3)
+        self.assertEqual({f"mux-peer-{index}".encode() for index in range(6)},
+                         {payload for payload, _ in echo.received if payload.startswith(b"mux-peer-")})
+        self.assertIn("tcp_connections=3", client.log())
 
     def test_ipv6_proxy_and_endpoints(self):
         try:
@@ -412,6 +431,8 @@ class TransportTests(unittest.TestCase):
             ["--raw-mode", "tcp", "--http-proxy", "localhost:80", "--http-proxy-auth", "secret-no-colon"],
             ["--raw-mode", "tcp", "--http-proxy-auth=user:secret"],
             ["--raw-mode", "tcp", "--http-proxy=user:secret@localhost:80"],
+            ["--raw-mode", "tcp", "--tcp-connections", "0"],
+            ["--raw-mode", "tcp", "--tcp-connections", "17"],
             ["--raw-mode", "tcp", "--key=secret"],
             ["--raw-mode", "tcp", "-ksecret", "-kduplicate"],
             ["--raw-mode", "tcp", "--easy-tcp"],

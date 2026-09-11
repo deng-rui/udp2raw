@@ -156,6 +156,7 @@ void print_help() {
     printf("client options:\n");
     printf("    --http-proxy          <host:port>     HTTP CONNECT proxy, requires --raw-mode tcp on both sides\n");
     printf("    --http-proxy-auth     <user:password> HTTP proxy Basic authentication\n");
+    printf("    --tcp-connections     <number>        parallel TCP MUX connections, 1..16 (default:1)\n");
     printf("    --source-ip           <ip>            force source-ip for raw socket\n");
     printf("    --source-port         <port>          force source-port for raw socket,tcp/udp only\n");
     printf("                                          this option disables port changing while re-connecting\n");
@@ -271,6 +272,7 @@ void process_arg(int argc, char *argv[])  // process all options
             {"raw-mode", required_argument, 0, 1},
             {"http-proxy", required_argument, 0, 1},
             {"http-proxy-auth", required_argument, 0, 1},
+            {"tcp-connections", required_argument, 0, 1},
             {"disable-color", no_argument, 0, 1},
             {"enable-color", no_argument, 0, 1},
             {"log-position", no_argument, 0, 1},
@@ -529,6 +531,11 @@ void process_arg(int argc, char *argv[])  // process all options
                     http_proxy_address = optarg;
                 } else if (strcmp(long_options[option_index].name, "http-proxy-auth") == 0) {
                     http_proxy_credentials = optarg;
+                } else if (strcmp(long_options[option_index].name, "tcp-connections") == 0) {
+                    if (!parse_bounded_decimal(optarg, 1, 16, tcp_connections)) {
+                        mylog(log_fatal, "--tcp-connections must be an integer in 1..16\n");
+                        myexit(-1);
+                    }
                 } else if (strcmp(long_options[option_index].name, "auth-mode") == 0) {
                     for (i = 0; i < auth_end; i++) {
                         if (strcmp(optarg, auth_mode_tostring[i]) == 0) {
@@ -753,6 +760,8 @@ void process_arg(int argc, char *argv[])  // process all options
     log_bare(log_info, "raw_mode=%s ", raw_mode_tostring[raw_mode]);
     log_bare(log_info, "cipher_mode=%s ", cipher_mode_tostring[cipher_mode]);
     log_bare(log_info, "auth_mode=%s ", auth_mode_tostring[auth_mode]);
+    if (raw_mode == mode_tcp && program_mode == client_mode)
+        log_bare(log_info, "tcp_connections=%d ", tcp_connections);
 
     log_bare(log_info, "key=<redacted> ");
 

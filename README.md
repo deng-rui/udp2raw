@@ -126,6 +126,7 @@ client options:
                                           this option disables port changing while re-connecting
     --http-proxy          <host:port>     client tcp mode: establish the tunnel with HTTP CONNECT
     --http-proxy-auth     <user:password> client tcp mode: send Proxy-Authorization Basic
+    --tcp-connections     <number>        parallel TCP MUX connections, 1..16 (default:1)
 other options:
     --conf-file           <string>        read options from a configuration file instead of command line.
                                           check example.conf in repo for format
@@ -200,12 +201,16 @@ server's TCP port. Both ends require this version and matching key, cipher and
 auth modes. Do not use `-a`, `-g` or `--easy-tcp` with TCP mode.
 
 TCP mode preserves UDP datagram boundaries up to 65507 bytes and reconnects
-automatically. The client keeps its conversation IDs, and the server keeps each
+automatically. Use `--tcp-connections N` on the client to create N parallel
+encrypted TCP/HTTP CONNECT streams; each UDP conversation stays on one stream,
+so a stalled TCP stream affects only its assigned conversations. The client keeps its conversation IDs, and the server keeps each
 conversation's connected UDP socket for `conv_timeout`, so a reconnect from the
 same running client preserves the remote UDP source port and common application
 state. Packets already in a broken TCP connection or sent while disconnected are
 still lost; a client process restart creates a new identity. Unlike FakeTCP, real
 TCP retransmits and delivers in order, which can increase latency on lossy links.
+MUX does not remove TCP's head-of-line blocking inside one stream; increase
+`--tcp-connections` when independent UDP flows need loss isolation.
 
 The workflow runs `tests/test_tcp_transport.py` against each Linux binary (with
 QEMU for Linux ARM targets) and on both Windows runners, covering proxy

@@ -14,6 +14,7 @@
 
 std::string http_proxy_address;
 std::string http_proxy_credentials;
+int tcp_connections = 1;
 
 namespace {
 const int nonce_size = 16;
@@ -221,11 +222,13 @@ struct tcp_context {
     ev_timer timer;
     list<unique_ptr<tcp_connection>> connections;
     unordered_map<string, unique_ptr<udp_peer>> server_peers;
+    unordered_map<u32_t, tcp_connection *> client_routes;
     tcp_connection *client = NULL;
     conv_manager_t<address_t> client_peers;
     char client_id[nonce_size] = {};
     vector<address_t> destinations;
     size_t destination_index = 0;
+    size_t client_round_robin = 0;
     size_t udp_count = 0, queued_bytes = 0;
     u64_t next_connect = 0, queue_drops = 0;
 
@@ -233,6 +236,8 @@ struct tcp_context {
         if (program_mode == client_mode) random_nonce(client_id);
     }
     void connect_client();
+    tcp_connection *select_client_connection(u32_t conv);
+    int client_connection_count() const;
     void queue_drop() {
         ++queue_drops;
         if ((queue_drops & (queue_drops - 1)) == 0)
@@ -305,6 +310,13 @@ void tcp_connection::fail(const char *reason) {
             ev_io_stop(context.loop, &peer.second->reader);
         }
     }
+    for (auto it = context.client_routes.begin(); it != context.client_routes.end();) {
+        if (it->second == this)
+            it = context.client_routes.erase(it);
+        else
+            ++it;
+    }
+    if (context.client == this) context.client = NULL;
     sock_close(fd);
     fd = -1;
 }
@@ -625,6 +637,38 @@ void tcp_connection::tick(u64_t now) {
     if (now - last_sent >= heartbeat_interval) control('P');
 }
 
+int tcp_context::client_connection_count() const {
+    int count = 0;
+    for (const auto &connection : connections)
+        if (connection->phase != tcp_phase::dead) ++count;
+    return count;
+}
+
+tcp_connection *tcp_context::select_client_connection(u32_t conv) {
+    auto route = client_routes.find(conv);
+    if (route != client_routes.end()) {
+        if (route->second && route->second->ready()) return route->second;
+        client_routes.erase(route);
+    }
+
+    vector<tcp_connection *> candidates;
+    size_t minimum_queue = connection_queue_limit + 1;
+    for (const auto &connection : connections) {
+        if (!connection->ready()) continue;
+        size_t queued = connection->queued();
+        if (queued < minimum_queue) {
+            minimum_queue = queued;
+            candidates.clear();
+            candidates.push_back(connection.get());
+        } else if (queued == minimum_queue) {
+            candidates.push_back(connection.get());
+        }
+    }
+    tcp_connection *selected = candidates.empty() ? NULL : candidates[client_round_robin++ % candidates.size()];
+    if (selected) client_routes[conv] = selected;
+    return selected;
+}
+
 void tcp_context::connect_client() {
     address_t address = destinations[destination_index++ % destinations.size()];
     int fd = new_socket(address, SOCK_STREAM);
@@ -640,9 +684,10 @@ void tcp_context::connect_client() {
         return;
     }
     connections.emplace_back(new tcp_connection(*this, fd, tcp_phase::connecting));
-    client = connections.back().get();
-    if (result == 0) client->connected();
-    else ev_io_start(loop, &client->writer);
+    tcp_connection *connection = connections.back().get();
+    if (!client) client = connection;
+    if (result == 0) connection->connected();
+    else ev_io_start(loop, &connection->writer);
 }
 
 void tcp_context::local_cb(struct ev_loop *, ev_io *watcher, int) {
@@ -676,7 +721,6 @@ void tcp_context::local_cb(struct ev_loop *, ev_io *watcher, int) {
             if (!would_block(error)) mylog(log_warn, "tcp local UDP receive failed: %s\n", get_sock_error());
             return;
         }
-        if (!context.client || !context.client->ready()) continue;
         u32_t conv;
         if (context.client_peers.is_data_used(source)) {
             conv = context.client_peers.find_conv_by_data(source);
@@ -689,7 +733,9 @@ void tcp_context::local_cb(struct ev_loop *, ev_io *watcher, int) {
             conv = context.client_peers.get_new_conv();
             context.client_peers.insert_conv(conv, source);
         }
-        context.client->send_datagram(conv, data, count);
+        tcp_connection *connection = context.select_client_connection(conv);
+        if (!connection) continue;
+        connection->send_datagram(conv, data, count);
     }
 }
 
@@ -716,12 +762,32 @@ void tcp_context::timer_cb(struct ev_loop *, ev_timer *watcher, int) {
     }
     if (program_mode == client_mode) {
         context.client_peers.clear_inactive0(NULL);
-        if (!context.client && now >= context.next_connect) context.connect_client();
+        for (auto it = context.client_routes.begin(); it != context.client_routes.end();) {
+            if (!context.client_peers.is_conv_used(it->first))
+                it = context.client_routes.erase(it);
+            else
+                ++it;
+        }
+        if (context.client_connection_count() < tcp_connections && now >= context.next_connect)
+            context.connect_client();
+        if (!context.client || !context.client->ready()) {
+            context.client = NULL;
+            for (const auto &connection : context.connections) {
+                if (connection->ready()) {
+                    context.client = connection.get();
+                    break;
+                }
+            }
+        }
     }
 }
 }  // namespace
 
 void validate_tcp_options() {
+    if (tcp_connections != 1 && (raw_mode != mode_tcp || program_mode != client_mode)) {
+        mylog(log_fatal, "--tcp-connections requires client mode and --raw-mode tcp\n");
+        myexit(-1);
+    }
     if ((!http_proxy_address.empty() || !http_proxy_credentials.empty()) && (raw_mode != mode_tcp || program_mode != client_mode)) {
         mylog(log_fatal, "HTTP proxy options require client mode and --raw-mode tcp\n");
         myexit(-1);
