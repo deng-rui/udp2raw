@@ -200,11 +200,12 @@ server's TCP port. Both ends require this version and matching key, cipher and
 auth modes. Do not use `-a`, `-g` or `--easy-tcp` with TCP mode.
 
 TCP mode preserves UDP datagram boundaries up to 65507 bytes and reconnects
-automatically. UDP packets sent while disconnected or when the send queue is
-full are dropped. Reconnection creates new server-side UDP sockets, so an
-application tied to the old UDP source port may need to reconnect. Unlike
-FakeTCP, real TCP retransmits and delivers in order, which can increase latency
-on lossy links.
+automatically. The client keeps its conversation IDs, and the server keeps each
+conversation's connected UDP socket for `conv_timeout`, so a reconnect from the
+same running client preserves the remote UDP source port and common application
+state. Packets already in a broken TCP connection or sent while disconnected are
+still lost; a client process restart creates a new identity. Unlike FakeTCP, real
+TCP retransmits and delivers in order, which can increase latency on lossy links.
 
 The workflow runs `tests/test_tcp_transport.py` against each Linux binary (with
 QEMU for Linux ARM targets) and on both Windows runners, covering proxy

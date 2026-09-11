@@ -26,7 +26,7 @@ const size_t http_header_limit = 16384;
 const size_t connection_queue_limit = 1024 * 1024;
 const size_t total_queue_limit = 16 * connection_queue_limit;
 const int io_batch_limit = 64;
-const char protocol_magic[] = "U2T1";
+const char protocol_magic[] = "U2T2";
 
 void put_u64(char *data, u64_t value) {
     value = hton64(value);
@@ -93,6 +93,14 @@ bool zero_nonce(const char *data) {
     return memcmp(data, zero, nonce_size) == 0;
 }
 
+string server_peer_key(const char *client_id, u32_t conv) {
+    string key(client_id, nonce_size);
+    char encoded_conv[sizeof(conv)];
+    write_u32(encoded_conv, conv);
+    key.append(encoded_conv, sizeof(encoded_conv));
+    return key;
+}
+
 bool proxy_endpoint(string &host, string &port) {
     string value = http_proxy_address;
     if (value.compare(0, 7, "http://") == 0) value.erase(0, 7);
@@ -142,16 +150,31 @@ struct tcp_context;
 struct tcp_connection;
 
 struct udp_peer {
-    tcp_connection &connection;
+    tcp_context &context;
+    tcp_connection *connection;
     u32_t conv;
     int fd;
     ev_io reader;
-    udp_peer(tcp_connection &connection, u32_t conv, int fd);
+    u64_t last_active;
+    udp_peer(tcp_context &context, tcp_connection *connection, u32_t conv, int fd);
     ~udp_peer();
     static void read_cb(struct ev_loop *, ev_io *watcher, int);
 };
 
 enum class tcp_phase { connecting, proxy, challenge, hello, accept, ready, dead };
+
+const char *phase_name(tcp_phase phase) {
+    switch (phase) {
+        case tcp_phase::connecting: return "connecting";
+        case tcp_phase::proxy: return "proxy";
+        case tcp_phase::challenge: return "challenge";
+        case tcp_phase::hello: return "hello";
+        case tcp_phase::accept: return "accept";
+        case tcp_phase::ready: return "ready";
+        case tcp_phase::dead: return "dead";
+    }
+    return "unknown";
+}
 
 struct tcp_connection {
     tcp_context &context;
@@ -160,12 +183,12 @@ struct tcp_connection {
     ev_io reader, writer;
     char local_nonce[nonce_size];
     char remote_nonce[nonce_size] = {};
+    char peer_id[nonce_size] = {};
+    bool has_peer_id = false;
     u64_t send_sequence = 1, recv_sequence = 1;
     u64_t started = get_current_time(), last_received = started, last_sent = started;
     string input, output;
     size_t written = 0, proxy_bytes = 0;
-    unordered_map<u32_t, unique_ptr<udp_peer>> peers;
-    lru_collector_t<u32_t> peer_lru;
     bool assembling = false;
     u32_t incoming_conv = 0;
     unsigned incoming_size = 0;
@@ -180,7 +203,7 @@ struct tcp_connection {
     void connected();
     void append_output(const string &bytes);
     bool encode(string &bytes, char type, u32_t conv, const char *data, int len);
-    bool control(char type);
+    bool control(char type, const char *data = NULL, int len = 0);
     void send_datagram(u32_t conv, const char *data, int len);
     void parse_input();
     bool process_record(char *plain, int len);
@@ -197,14 +220,18 @@ struct tcp_context {
     ev_io local_reader;
     ev_timer timer;
     list<unique_ptr<tcp_connection>> connections;
+    unordered_map<string, unique_ptr<udp_peer>> server_peers;
     tcp_connection *client = NULL;
     conv_manager_t<address_t> client_peers;
+    char client_id[nonce_size] = {};
     vector<address_t> destinations;
     size_t destination_index = 0;
     size_t udp_count = 0, queued_bytes = 0;
     u64_t next_connect = 0, queue_drops = 0;
 
-    explicit tcp_context(struct ev_loop *loop) : loop(loop) {}
+    explicit tcp_context(struct ev_loop *loop) : loop(loop) {
+        if (program_mode == client_mode) random_nonce(client_id);
+    }
     void connect_client();
     void queue_drop() {
         ++queue_drops;
@@ -215,22 +242,28 @@ struct tcp_context {
     static void timer_cb(struct ev_loop *, ev_timer *watcher, int);
 };
 
-udp_peer::udp_peer(tcp_connection &connection, u32_t conv, int fd) : connection(connection), conv(conv), fd(fd) {
+udp_peer::udp_peer(tcp_context &context, tcp_connection *connection, u32_t conv, int fd)
+    : context(context), connection(connection), conv(conv), fd(fd), last_active(get_current_time()) {
     ev_io_init(&reader, read_cb, fd, EV_READ);
     reader.data = this;
-    ev_io_start(connection.context.loop, &reader);
-    ++connection.context.udp_count;
+    if (connection) ev_io_start(context.loop, &reader);
+    ++context.udp_count;
 }
 
 udp_peer::~udp_peer() {
-    ev_io_stop(connection.context.loop, &reader);
+    ev_io_stop(context.loop, &reader);
     sock_close(fd);
-    --connection.context.udp_count;
+    --context.udp_count;
 }
 
 void udp_peer::read_cb(struct ev_loop *, ev_io *watcher, int) {
     udp_peer &peer = *(udp_peer *)watcher->data;
-    for (int i = 0; i < io_batch_limit && peer.connection.ready(); ++i) {
+    if (!peer.connection || !peer.connection->ready()) {
+        char discarded[65536];
+        recv(peer.fd, discarded, sizeof(discarded), 0);
+        return;
+    }
+    for (int i = 0; i < io_batch_limit && peer.connection && peer.connection->ready(); ++i) {
         char data[65536];
         int len = recv(peer.fd, data, sizeof(data), 0);
         if (len < 0) {
@@ -239,8 +272,8 @@ void udp_peer::read_cb(struct ev_loop *, ev_io *watcher, int) {
             if (!would_block(error)) mylog(log_warn, "tcp remote UDP receive failed: %s\n", get_sock_error());
             return;
         }
-        peer.connection.peer_lru.update(peer.conv);
-        peer.connection.send_datagram(peer.conv, data, len);
+        peer.last_active = get_current_time();
+        peer.connection->send_datagram(peer.conv, data, len);
     }
 }
 
@@ -262,11 +295,16 @@ tcp_connection::~tcp_connection() {
 
 void tcp_connection::fail(const char *reason) {
     if (phase == tcp_phase::dead) return;
-    mylog(log_warn, "tcp tunnel closed: %s\n", reason);
+    mylog(log_warn, "tcp tunnel closed (phase=%s): %s\n", phase_name(phase), reason);
     phase = tcp_phase::dead;
     ev_io_stop(context.loop, &reader);
     ev_io_stop(context.loop, &writer);
-    for (auto &peer : peers) ev_io_stop(context.loop, &peer.second->reader);
+    for (auto &peer : context.server_peers) {
+        if (peer.second->connection == this) {
+            peer.second->connection = NULL;
+            ev_io_stop(context.loop, &peer.second->reader);
+        }
+    }
     sock_close(fd);
     fd = -1;
 }
@@ -303,13 +341,13 @@ bool tcp_connection::encode(string &bytes, char type, u32_t conv, const char *da
     return true;
 }
 
-bool tcp_connection::control(char type) {
+bool tcp_connection::control(char type, const char *data, int len) {
     if (queued() + max_data_len + 2 > connection_queue_limit || context.queued_bytes + max_data_len + 2 > total_queue_limit) {
         fail("control send queue limit");
         return false;
     }
     string bytes;
-    if (!encode(bytes, type, 0, NULL, 0)) {
+    if (!encode(bytes, type, 0, data, len)) {
         fail("encryption failed");
         return false;
     }
@@ -481,12 +519,14 @@ bool tcp_connection::process_record(char *plain, int len) {
         if (type != 'C' || conv != 0 || data_len != 0 || !zero_nonce(plain + 37)) return false;
         memcpy(remote_nonce, plain + 21, nonce_size);
         phase = tcp_phase::accept;
-        return control('H');
+        return control('H', context.client_id, nonce_size);
     }
     if (memcmp(plain + 37, local_nonce, nonce_size) != 0) return false;
     if (phase == tcp_phase::hello) {
-        if (type != 'H' || conv != 0 || data_len != 0) return false;
+        if (type != 'H' || conv != 0 || data_len != nonce_size) return false;
         memcpy(remote_nonce, plain + 21, nonce_size);
+        memcpy(peer_id, plain + record_header_size, nonce_size);
+        has_peer_id = true;
         phase = tcp_phase::ready;
         return control('A');
     }
@@ -534,8 +574,10 @@ void tcp_connection::deliver(u32_t conv, const char *data, int len) {
             mylog(log_warn, "tcp local UDP send failed: %s\n", get_sock_error());
         return;
     }
-    auto found = peers.find(conv);
-    if (found == peers.end()) {
+    if (!has_peer_id) return;
+    string key = server_peer_key(peer_id, conv);
+    auto found = context.server_peers.find(key);
+    if (found == context.server_peers.end()) {
         if (context.udp_count >= max_conv_num) {
             mylog(log_warn, "tcp UDP conversation limit reached\n");
             return;
@@ -550,11 +592,17 @@ void tcp_connection::deliver(u32_t conv, const char *data, int len) {
             sock_close(udp_fd);
             return;
         }
-        peers.emplace(conv, unique_ptr<udp_peer>(new udp_peer(*this, conv, udp_fd)));
-        peer_lru.new_key(conv);
-        found = peers.find(conv);
+        context.server_peers.emplace(key, unique_ptr<udp_peer>(new udp_peer(context, this, conv, udp_fd)));
+        found = context.server_peers.find(key);
     } else {
-        peer_lru.update(conv);
+        if (found->second->connection && found->second->connection != this) {
+            mylog(log_warn, "tcp UDP conversation is already attached to another connection\n");
+            return;
+        }
+        bool reattached = found->second->connection == NULL;
+        found->second->connection = this;
+        found->second->last_active = get_current_time();
+        if (reattached) ev_io_start(context.loop, &found->second->reader);
     }
     if (send(found->second->fd, data, len, 0) != len)
         mylog(log_warn, "tcp remote UDP send failed: %s\n", get_sock_error());
@@ -575,13 +623,6 @@ void tcp_connection::tick(u64_t now) {
         return;
     }
     if (now - last_sent >= heartbeat_interval) control('P');
-    int budget = peer_lru.size() / conv_clear_ratio + conv_clear_min;
-    while (budget-- && !peer_lru.empty()) {
-        u32_t conv;
-        if (now - peer_lru.peek_back(conv) < conv_timeout) break;
-        peers.erase(conv);
-        peer_lru.erase(conv);
-    }
 }
 
 void tcp_context::connect_client() {
@@ -664,6 +705,14 @@ void tcp_context::timer_cb(struct ev_loop *, ev_timer *watcher, int) {
             }
             it = context.connections.erase(it);
         } else ++it;
+    }
+    if (program_mode == server_mode) {
+        for (auto it = context.server_peers.begin(); it != context.server_peers.end();) {
+            if (now - it->second->last_active >= conv_timeout)
+                it = context.server_peers.erase(it);
+            else
+                ++it;
+        }
     }
     if (program_mode == client_mode) {
         context.client_peers.clear_inactive0(NULL);

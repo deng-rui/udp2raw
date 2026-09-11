@@ -48,7 +48,7 @@ def receive_record(sock):
 
 
 def plain_record(kind, sender, receiver, seq, conv=0, data=b""):
-    plain = os.urandom(16) + b"U2T1" + kind + sender + receiver + struct.pack("!QI", seq, conv) + data
+    plain = os.urandom(16) + b"U2T2" + kind + sender + receiver + struct.pack("!QI", seq, conv) + data
     return struct.pack("!H", len(plain)) + plain
 
 
@@ -296,14 +296,17 @@ class TransportTests(unittest.TestCase):
         self.assertNotIn("wpcap.dll", server.log())
 
     def test_proxy_disconnect_reconnects(self):
-        target, _, _ = self.server()
+        target, echo, _ = self.server()
         proxy = self.proxy(target)
         local, client = self.client(target, proxy)
         sock = self.udp_socket()
         self.exchange(sock, local, b"before disconnect")
+        source_port_before = next(source[1] for payload, source in reversed(echo.received) if payload == b"before disconnect")
         proxy.disconnect()
         client.wait_log("tcp tunnel ready", occurrences=2)
         self.exchange(sock, local, b"after reconnect")
+        source_port_after = next(source[1] for payload, source in reversed(echo.received) if payload == b"after reconnect")
+        self.assertEqual(source_port_before, source_port_after)
         self.assertGreaterEqual(len(proxy.requests), 2)
 
     def test_independent_clients_and_cipher_modes(self):
@@ -356,7 +359,7 @@ class TransportTests(unittest.TestCase):
         sock = socket.create_connection(target, timeout=2)
         self.addCleanup(sock.close)
         challenge = receive_record(sock)
-        self.assertEqual(b"U2T1C", challenge[16:21])
+        self.assertEqual(b"U2T2C", challenge[16:21])
         return sock, os.urandom(16), challenge[21:37]
 
     def assert_closed(self, sock, timeout=3):
@@ -371,7 +374,8 @@ class TransportTests(unittest.TestCase):
     def test_replayed_handshake_and_record_are_rejected(self):
         target, echo, _ = self.server(cipher="none", auth="none")
         sock, client_nonce, server_nonce = self.open_plain(target)
-        hello = plain_record(b"H", client_nonce, server_nonce, 1)
+        client_id = os.urandom(16)
+        hello = plain_record(b"H", client_nonce, server_nonce, 1, data=client_id)
         sock.sendall(hello)
         self.assertEqual(b"A", receive_record(sock)[20:21])
         data = plain_record(b"D", client_nonce, server_nonce, 2, 7, struct.pack("!HH", 4, 0) + b"once")
