@@ -258,6 +258,7 @@ struct tcp_context {
     tcp_connection *select_connection(const char *peer_id, size_t &round_robin);
     tcp_connection *select_client_connection();
     tcp_connection *select_server_connection(const char *peer_id);
+    void resume_server_peers(const char *peer_id);
     int client_connection_count() const;
     void queue_drop() {
         ++queue_drops;
@@ -286,6 +287,11 @@ udp_peer::~udp_peer() {
 
 void udp_peer::read_cb(struct ev_loop *, ev_io *watcher, int) {
     udp_peer &peer = *(udp_peer *)watcher->data;
+    if (!peer.context.select_server_connection(peer.client_id)) {
+        // 没有可用 TCP lane 时保留 UDP 内核缓冲，等握手完成后再继续读取。
+        ev_io_stop(peer.context.loop, &peer.reader);
+        return;
+    }
     for (int i = 0; i < io_batch_limit; ++i) {
         char data[65536];
         int len = recv(peer.fd, data, sizeof(data), 0);
@@ -297,7 +303,11 @@ void udp_peer::read_cb(struct ev_loop *, ev_io *watcher, int) {
         }
         peer.last_active = get_current_time();
         tcp_connection *connection = peer.context.select_server_connection(peer.client_id);
-        if (connection) connection->send_datagram(peer.conv, data, len);
+        if (!connection) {
+            ev_io_stop(peer.context.loop, &peer.reader);
+            return;
+        }
+        connection->send_datagram(peer.conv, data, len);
     }
 }
 
@@ -572,6 +582,7 @@ bool tcp_connection::process_record(char *plain, int len) {
         if (!control('A')) return false;
         phase = tcp_phase::ready;
         mylog(log_info, "tcp tunnel ready%s\n", http_proxy_address.empty() ? "" : " through HTTP CONNECT proxy");
+        context.resume_server_peers(peer_id);
         return true;
     }
 
@@ -702,6 +713,14 @@ tcp_connection *tcp_context::select_client_connection() {
 
 tcp_connection *tcp_context::select_server_connection(const char *peer_id) {
     return select_connection(peer_id, server_round_robin);
+}
+
+void tcp_context::resume_server_peers(const char *peer_id) {
+    for (auto &entry : server_peers) {
+        udp_peer &peer = *entry.second;
+        if (memcmp(peer.client_id, peer_id, nonce_size) != 0) continue;
+        if (!ev_is_active(&peer.reader)) ev_io_start(loop, &peer.reader);
+    }
 }
 
 void tcp_context::connect_client() {

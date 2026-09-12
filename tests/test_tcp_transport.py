@@ -387,6 +387,20 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(source_port_before, source_port_after)
         self.assertGreaterEqual(len(proxy.requests), 2)
 
+    def test_passwordless_proxy(self):
+        """Test HTTP proxy without authentication (no --http-proxy-auth)"""
+        target, echo, _ = self.server()
+        proxy = self.proxy(target)  # No credentials
+        local, client = self.client(target, proxy)  # No credentials passed
+        sock = self.udp_socket()
+        self.exchange(sock, local, b"test passwordless proxy")
+        # Verify the CONNECT request has no Proxy-Authorization header
+        self.assertEqual(1, len(proxy.requests))
+        request = proxy.requests[0].decode()
+        self.assertIn("CONNECT", request)
+        self.assertNotIn("Proxy-Authorization", request)
+        self.assertEqual([], proxy.errors)
+
     def test_independent_clients_and_cipher_modes(self):
         for cipher, auth in (("aes128cbc", "md5"), ("aes128cfb", "hmac_sha1"), ("xor", "simple"), ("none", "hmac_sha1")):
             with self.subTest(cipher=cipher, auth=auth):
@@ -474,10 +488,12 @@ class TransportTests(unittest.TestCase):
             self.exchange(sock, local, f"surviving-lane-{index}".encode())
         client.wait_log("tcp tunnel ready", occurrences=4)
         proxy.disconnect()
+        client.wait_log("tcp tunnel closed", occurrences=4)
+        server.wait_log("tcp tunnel closed", occurrences=4)
+        # The server must retain this UDP reply until one replacement lane is ready.
+        echo.sock.sendto(b"server push during reconnect", source)
         client.wait_log("tcp tunnel ready", occurrences=7)
-        # A reply can arrive before a new client datagram after all lanes reconnect.
-        echo.sock.sendto(b"server push after reconnect", source)
-        self.assertEqual(b"server push after reconnect", sock.recvfrom(65536)[0])
+        self.assertEqual(b"server push during reconnect", sock.recvfrom(65536)[0])
         self.exchange(sock, local, b"after all lanes reconnect")
         self.assertEqual({source}, {address for _, address in echo.received})
 
